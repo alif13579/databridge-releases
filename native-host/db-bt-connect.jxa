@@ -1,0 +1,37 @@
+// db-bt-connect.jxa — ensure an IOBluetooth (ACL) connection to the printer
+// whose /dev/cu BSD name is given as argv[0] (e.g. TL5XBTPrinter).
+// Bluetooth-SPP serial nodes on macOS sometimes sit "Not Connected": opening
+// the /dev node alone can silently buffer writes forever. Forcing the ACL
+// connect first (IOBluetoothDevice.openConnection) makes the SPP channel
+// come up on the next open. Prints one line:
+//   connected=<0|1> via=<already|open|fail> name=<...> err=<...>
+// usage: osascript -l JavaScript db-bt-connect.jxa TL5XBTPrinter
+ObjC.import('IOBluetooth');
+
+function norm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function run(argv) {
+  var want = norm(argv[0] || 'TL5XBTPrinter');
+  var devs = $.IOBluetoothDevice.pairedDevices;
+  var n = (devs && !devs.isNil()) ? devs.count : 0;
+  var match = null;
+  for (var i = 0; i < n; i++) {
+    var d = devs.objectAtIndex(i);
+    if (d.isNil()) continue;
+    var nm = ObjC.unwrap(d.nameOrAddress);
+    if (norm(nm).indexOf(want) === 0 || want.indexOf(norm(nm)) === 0 ||
+        norm(nm).indexOf('tl5x') === 0 || norm(nm).indexOf('tl5x') > -1) {
+      match = d;
+      break;
+    }
+  }
+  if (!match) return 'connected=0 via=fail err=device-not-paired';
+  if (match.isConnected) return 'connected=1 via=already name=' + ObjC.unwrap(match.nameOrAddress);
+  match.openConnection; // JXA: property eval INVOKES the no-arg method
+  var t0 = Date.now();
+  while (!match.isConnected && (Date.now() - t0) < 9000) { delay(0.25); }
+  return 'connected=' + (match.isConnected ? 1 : 0) +
+         ' via=open name=' + ObjC.unwrap(match.nameOrAddress);
+}
