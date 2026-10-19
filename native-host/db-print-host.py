@@ -291,7 +291,52 @@ def discover_printers():
     found.sort(key=lambda x: 0 if x[1] == "cable" else 1)
     return found
 BAUDS = [115200, 9600]
-HOST_VERSION = 1
+HOST_VERSION = 2
+
+# ── Warm serial port ─────────────────────────────────────────────────────
+# The extension now keeps ONE host process alive for every print (persistent
+# native-messaging port), so the printer's serial port can stay OPEN between
+# jobs: no per-print Python spawn and no per-print Bluetooth reconnect — the
+# two biggest sources of "print e delay". The port is reused while the last
+# print is fresh; after WARM_MAX_IDLE seconds it is reopened from scratch so
+# a sleeping printer gets a fresh connection (a reconnect is what wakes it).
+WARM_MAX_IDLE = 600.0
+_WARM = {"dev": None, "baud": None, "ser": None, "ts": 0.0}
+
+
+def warm_close():
+    try:
+        if _WARM.get("ser") is not None:
+            _WARM["ser"].close()
+    except Exception:
+        pass
+    _WARM["dev"] = None
+    _WARM["baud"] = None
+    _WARM["ser"] = None
+    _WARM["ts"] = 0.0
+
+
+def warm_try(tspl, dev=None):
+    """Reuse the held-open port (same device, not idle too long). Returns a
+    result dict on success, None when there is no usable warm port."""
+    s = _WARM.get("ser")
+    if s is None:
+        return None
+    if dev and dev != _WARM.get("dev"):
+        return None
+    if time.time() - (_WARM.get("ts") or 0.0) > WARM_MAX_IDLE:
+        warm_close()
+        return None
+    try:
+        s.write(tspl)
+        s.flush()
+        time.sleep(0.15)
+        _WARM["ts"] = time.time()
+        return {"ok": True, "device": _WARM["dev"], "baud": _WARM["baud"],
+                "bytes": len(tspl), "conn": conn_type(_WARM["dev"]), "warm": True}
+    except Exception:
+        warm_close()
+        return None
 
 
 def read_msg():
@@ -1245,32 +1290,63 @@ def do_print(p):
         return {"ok": False, "error": "empty consignment id"}
     ox, oy = stock_offset(p)
     tspl = apply_offset(build_tspl(p), ox, oy)
-    # Printer choice: explicit message/config device wins; otherwise a
-    # discovered CABLE printer beats everything, then the CONNECTED
-    # (preferred) device, then other bluetooth, then the built-in default.
+    # Connection choice — `prefer` (payload or config, default "auto"):
+    #   auto  -> the CONNECTED (preferred) device first, then Bluetooth,
+    #            then cable. Bluetooth-first: the extension acts as the
+    #            Bluetooth printer driver (no cable needed).
+    #   bt    -> Bluetooth only (never touches a cable port).
+    #   cable -> cable only.
+    # An explicit message/config device still wins over everything.
+    pref = str(p.get("prefer") or CONFIG.get("prefer") or "auto").strip().lower()
+    if pref == "bluetooth":
+        pref = "bt"
+    if pref == "usb":
+        pref = "cable"
+    if pref not in ("auto", "bt", "cable"):
+        pref = "auto"
+    # Fast path: a warm port that doesn't contradict the choice skips
+    # discovery + connect entirely (this is what makes back-to-back prints
+    # instant on Windows Bluetooth SPP).
+    warm_dev = _WARM.get("dev")
+    if warm_dev and not p.get("device") and not CONFIG.get("device"):
+        if pref == "auto" or conn_type(warm_dev) == pref:
+            st = warm_try(tspl, warm_dev)
+            if st:
+                return st
     if p.get("device"):
         cands = [(p.get("device"), conn_type(p.get("device")))]
     elif CONFIG.get("device"):
         cands = [(CONFIG.get("device"), conn_type(CONFIG.get("device")))]
     else:
-        disc = discover_printers()  # already cable-first
-        cands = [c for c in disc if c[1] == "cable"]
+        cands = []
         if CONFIG.get("preferred"):
-            cands.append((CONFIG.get("preferred"), conn_type(CONFIG.get("preferred"))))
-        cands += [c for c in disc if c[1] == "bluetooth"]
+            pdev = CONFIG.get("preferred")
+            pconn = conn_type(pdev)
+            if pref == "auto" or pconn == pref:
+                cands.append((pdev, pconn))
+        disc = discover_printers()
+        if pref in ("auto", "bt"):
+            cands += [c for c in disc if c[1] == "bluetooth"]
+        if pref in ("auto", "cable"):
+            cands += [c for c in disc if c[1] == "cable"]
         seen, uniq_cands = set(), []
         for dev, conn in cands:
             if dev not in seen:
                 seen.add(dev)
                 uniq_cands.append((dev, conn))
-        cands = uniq_cands or [(DEVICE_DEFAULT, conn_type(DEVICE_DEFAULT))]
+        if not uniq_cands:
+            dconn = conn_type(DEVICE_DEFAULT)
+            if pref == "auto" or dconn == pref:
+                uniq_cands = [(DEVICE_DEFAULT, dconn)]
+        cands = uniq_cands
+    if not cands:
+        return {"ok": False, "error": "no %s printer found (pair the TL5X / check connection)" % pref}
     last = None
     tried = []
-    try:
-        import serial
-    except ImportError:
-        return {"ok": False, "error": "pyserial missing (pip install pyserial)"}
     for dev, conn in cands:
+        st = warm_try(tspl, dev)  # covers the explicit-device case too
+        if st:
+            return st
         for baud in BAUDS:
             try:
                 # write_timeout: a sleeping/offline BT printer must fail fast,
@@ -1279,12 +1355,19 @@ def do_print(p):
                 try:
                     s.write(tspl)
                     s.flush()
-                    time.sleep(1.0)
-                finally:
+                    time.sleep(0.15)
+                except Exception:
                     try:
                         s.close()
                     except Exception:
                         pass
+                    raise
+                # Success — keep this port warm for the next print.
+                warm_close()
+                _WARM["dev"] = dev
+                _WARM["baud"] = baud
+                _WARM["ser"] = s
+                _WARM["ts"] = time.time()
                 return {"ok": True, "device": dev, "baud": baud,
                         "bytes": len(tspl), "conn": conn}
             except Exception as e:  # noqa: BLE001 - try next candidate
@@ -1319,6 +1402,8 @@ def handle(msg):
         return {"ok": True, "host": "db-print", "version": HOST_VERSION,
                 "device": DEVICE_DEFAULT, "conn": conn_type(DEVICE_DEFAULT),
                 "preferred": CONFIG.get("preferred") or "",
+                "prefer": CONFIG.get("prefer", "auto"),
+                "warm": bool(_WARM.get("ser")),
                 "width_mm": CONFIG.get("width_mm", 48),
                 "height_mm": CONFIG.get("height_mm", 80),
                 "align": CONFIG.get("align", "left"),
@@ -1344,17 +1429,36 @@ def handle(msg):
             return {"ok": False, "error": "bad offset"}
         brd = (str(msg.get("border", "false")).strip().lower()
                in ("1", "true", "on", "yes"))
-        ok, err = save_config({"width_mm": w, "height_mm": h, "align": a,
-                               "offset_x_mm": ox, "offset_y_mm": oy,
-                               "border": brd})
+        patch = {"width_mm": w, "height_mm": h, "align": a,
+                 "offset_x_mm": ox, "offset_y_mm": oy, "border": brd}
+        new_prefer = None
+        if msg.get("prefer") is not None:
+            pv = str(msg.get("prefer")).strip().lower()
+            if pv in ("bluetooth", "bt"):
+                pv = "bt"
+            elif pv in ("usb", "cable"):
+                pv = "cable"
+            else:
+                pv = "auto"
+            if pv != (CONFIG.get("prefer") or "auto"):
+                # Re-evaluate the device on the next print (drop the warm
+                # port so a stale choice can't keep printing).
+                warm_close()
+            patch["prefer"] = pv
+            new_prefer = pv
+        ok, err = save_config(patch)
         if not ok:
             return {"ok": False, "error": "config save failed: " + err}
-        return {"ok": True, "width_mm": w, "height_mm": h, "align": a,
-                "offset_x_mm": ox, "offset_y_mm": oy, "border": brd}
+        out = {"ok": True, "width_mm": w, "height_mm": h, "align": a,
+               "offset_x_mm": ox, "offset_y_mm": oy, "border": brd}
+        if new_prefer is not None:
+            out["prefer"] = new_prefer
+        return out
     if action == "connect_device":
         dev = tspl_text(msg.get("device"), 128)
         if not dev:
             return {"ok": False, "error": "empty device"}
+        warm_close()  # never probe a port we are holding open ourselves
         ok, info = probe_device(dev)
         if not ok:
             return {"ok": False, "error": info, "device": dev}
@@ -1450,10 +1554,20 @@ def main():
         if msg is None:
             break  # EOF: Chrome closed the port
         try:
-            write_msg(handle(msg))
+            res = handle(msg)
         except Exception as e:  # noqa: BLE001 - never die on one request
+            res = {"ok": False, "error": str(e)}
+        try:
+            # Echo the request id: the extension keeps ONE host process for
+            # every call (persistent port), so replies are matched by id.
+            if isinstance(res, dict) and isinstance(msg, dict) and msg.get("id") is not None:
+                res = dict(res)
+                res["id"] = msg.get("id")
+            write_msg(res)
+        except Exception:
             try:
-                write_msg({"ok": False, "error": str(e)})
+                write_msg({"ok": False, "error": "response encode failed",
+                           "id": (msg.get("id") if isinstance(msg, dict) else None)})
             except Exception:
                 break
 
