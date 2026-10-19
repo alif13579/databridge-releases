@@ -21,6 +21,8 @@ import os
 import json
 import struct
 import time
+import subprocess
+import socket
 
 
 def load_config():
@@ -290,6 +292,153 @@ def discover_printers():
         pass
     found.sort(key=lambda x: 0 if x[1] == "cable" else 1)
     return found
+
+
+# ── macOS CUPS driver health / test / restart ────────────────────────────
+# The cable-free path is: website print → CUPS queue "TL5X_Bluetooth" →
+# user LaunchAgent com.databridge.btprint (db-bt-daemon.py) → SPP. These
+# actions let the popup answer "driver thik ache?" without a real print.
+DRIVER_QUEUE = "TL5X_Bluetooth"
+DRIVER_LABEL = "com.databridge.btprint"
+DAEMON_LOG = "/private/tmp/databridge-daemon.log"
+DAEMON_PORT = 19100
+
+
+def _run(cmd, timeout=15):
+    """Run a small system command, never raise. Returns (rc, out, err)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception as e:  # noqa: BLE001
+        return -1, "", str(e)
+
+
+def _tail(path, nbytes=600):
+    """Last non-empty line of a log file (best-effort)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            lines = [ln for ln in f.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+            return lines[-1][:300] if lines else ""
+    except Exception:
+        return ""
+
+
+def _pdf_escape(s):
+    return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def make_test_pdf(path):
+    """Minimal one-page 48x80mm PDF (Helvetica text) for a driver test print.
+    Pure stdlib — reportlab/CoreGraphics are not guaranteed on a fresh Mac."""
+    w, h = 136.06, 226.77
+    rows = [
+        (14, h - 34, 15, "DATABRIDGE"),
+        (14, h - 52, 9, "BLUETOOTH DRIVER TEST"),
+        (14, h - 72, 9, time.strftime("%Y-%m-%d %H:%M:%S")),
+        (14, h - 112, 9, "If this label prints,"),
+        (14, h - 126, 9, "the CUPS driver works."),
+        (14, h - 166, 8, "queue: " + DRIVER_QUEUE),
+    ]
+    cmds = ["0.5 w 6 6 %.2f %.2f re S" % (w - 12, h - 12)]
+    for x, y, size, text in rows:
+        cmds.append("BT /F1 %.1f Tf %.2f %.2f Td (%s) Tj ET" % (size, x, y, _pdf_escape(text)))
+    stream = "\n".join(cmds).encode("latin-1", "replace")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] "
+         "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>" % (w, h)).encode(),
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += ("%d 0 obj\n" % i).encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += ("xref\n0 %d\n" % (len(objs) + 1)).encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += ("%010d 00000 n \n" % off).encode()
+    out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+            % (len(objs) + 1, xref)).encode()
+    with open(path, "wb") as f:
+        f.write(out)
+    return path
+
+
+def driver_status():
+    """Everything the popup needs for the green/red driver row."""
+    if sys.platform != "darwin":
+        return {"ok": True, "supported": False, "platform": sys.platform}
+    daemon = {"loaded": False, "pid": 0, "last_exit": "", "plist": False}
+    try:
+        daemon["plist"] = os.path.exists(
+            os.path.expanduser("~/Library/LaunchAgents/%s.plist" % DRIVER_LABEL))
+    except Exception:
+        pass
+    rc, so, _se = _run(["/bin/launchctl", "list"])
+    if rc == 0:
+        for line in so.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] == DRIVER_LABEL:
+                daemon["loaded"] = True
+                daemon["pid"] = int(parts[0]) if parts[0].isdigit() else 0
+                daemon["last_exit"] = parts[1]
+                break
+    queue = {"exists": False, "state": ""}
+    rc, so, se = _run(["/usr/bin/lpstat", "-p", DRIVER_QUEUE])
+    queue["state"] = (so or se or "").splitlines()[0][:200] if (so or se) else ""
+    queue["exists"] = rc == 0 and DRIVER_QUEUE in (so or "")
+    listening = False
+    try:
+        s = socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=1)
+        s.close()
+        listening = True
+    except Exception:
+        pass
+    bt_dev = [d for d, c in discover_printers() if c == "bluetooth"]
+    return {
+        "ok": True, "supported": True, "platform": "darwin",
+        "daemon": daemon, "queue": queue,
+        "port": {"listening": listening, "port": DAEMON_PORT},
+        "bt_devices": bt_dev,
+        "daemon_log": _tail(DAEMON_LOG),
+    }
+
+
+def driver_test():
+    """Print a tiny built-in test label through the CUPS queue (end-to-end:
+    spool → PPD passthrough → daemon → raster → TSPL → Bluetooth)."""
+    if sys.platform != "darwin":
+        return {"ok": False, "supported": False,
+                "error": "macOS driver only — Windows prints directly via the host"}
+    try:
+        path = make_test_pdf("/tmp/db-driver-test.pdf")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "PDF build failed: %s" % e}
+    rc, so, se = _run(["/usr/bin/lp", "-d", DRIVER_QUEUE, path], timeout=25)
+    if rc != 0:
+        return {"ok": False, "error": (se or so or "lp failed")[:300], "pdf": path}
+    return {"ok": True, "job": so[:200], "pdf": path}
+
+
+def driver_restart():
+    """Kickstart the LaunchAgent (safe: KeepAlive would restart it anyway)."""
+    if sys.platform != "darwin":
+        return {"ok": False, "supported": False, "error": "macOS only"}
+    rc, so, se = _run(["/bin/launchctl", "kickstart", "-k",
+                       "gui/%d/%s" % (os.getuid(), DRIVER_LABEL)], timeout=20)
+    time.sleep(0.6)
+    st = driver_status()
+    return {"ok": rc == 0, "output": (so or se or "")[:300],
+            "daemon": st.get("daemon"), "port": st.get("port")}
+
+
 BAUDS = [115200, 9600]
 HOST_VERSION = 2
 
@@ -1411,6 +1560,12 @@ def handle(msg):
                 "offset_y_mm": CONFIG.get("offset_y_mm", 0),
                 "border": bool(CONFIG.get("border", False)),
                 "printers": [{"device": d, "conn": c} for d, c in discover_printers()]}
+    if action == "driver_status":
+        return driver_status()
+    if action == "driver_test":
+        return driver_test()
+    if action == "driver_restart":
+        return driver_restart()
     if action == "set_sticker_config":
         try:
             w = max(30, min(110, int(float(msg.get("width_mm", 48)))))
