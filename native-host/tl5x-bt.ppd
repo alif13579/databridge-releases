@@ -1,0 +1,78 @@
+*PPD-Adobe: "4.3"
+*FormatVersion: "4.3"
+*FileVersion: "1.2"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "TL5XBT.PPD"
+*Manufacturer: "DataBridge"
+*Product: "(TL5X Bluetooth)"
+*ModelName: "DataBridge TL5X Bluetooth Label Printer"
+*ShortNickName: "TL5X BT"
+*NickName: "DataBridge TL5X Bluetooth"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*FileSystem: False
+*Throughput: "1"
+*LandscapeOrientation: Plus90
+*VariablePaperSize: False
+*TTRasterizer: Type42
+
+*% DataBridge: the backend daemon receives raw PDF and renders it to
+*% TSPL bitmap for the TL5X (Bluetooth SPP). No CUPS filters.
+*cupsFilter: "application/pdf 0 -"
+
+*DefaultResolution: 203dpi
+*OpenUI *Resolution/Output Resolution: PickOne
+*OrderDependency: 10 AnySetup *Resolution
+*DefaultResolution: 203dpi
+*Resolution 203dpi/203 dpi: "<</HWResolution[203 203]>>setpagedevice"
+*CloseUI: *Resolution
+
+*DefaultColorModel: Gray
+*OpenUI *ColorModel/Color Model: PickOne
+*OrderDependency: 10 AnySetup *ColorModel
+*DefaultColorModel: Gray
+*ColorModel Gray/Grayscale: "<</cupsColorSpace 3/cupsBitsPerColor 8>>setpagedevice"
+*CloseUI: *ColorModel
+
+*DefaultPageSize: w48h80
+*DefaultPageRegion: w48h80
+*DefaultImageableArea: w48h80
+*DefaultPaperDimension: w48h80
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*PageSize w48h80/48 x 80 mm Label: "<</PageSize[136.06 226.77]/ImagingBBox null>>setpagedevice"
+*PageSize w60h80/60 x 80 mm Label: "<</PageSize[170.08 226.77]/ImagingBBox null>>setpagedevice"
+*PageSize w80h100/80 x 100 mm Label: "<</PageSize[226.77 283.46]/ImagingBBox null>>setpagedevice"
+*PageSize w100h150/100 x 150 mm Label: "<</PageSize[283.46 425.20]/ImagingBBox null>>setpagedevice"
+*PageSize w100h180/100 x 180 mm Label: "<</PageSize[283.46 510.24]/ImagingBBox null>>setpagedevice"
+*PageSize A4/A4: "<</PageSize[595.28 841.89]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageSize
+*OpenUI *PageRegion: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*PageRegion w48h80/48 x 80 mm Label: "<</PageSize[136.06 226.77]/ImagingBBox null>>setpagedevice"
+*PageRegion w60h80/60 x 80 mm Label: "<</PageSize[170.08 226.77]/ImagingBBox null>>setpagedevice"
+*PageRegion w80h100/80 x 100 mm Label: "<</PageSize[226.77 283.46]/ImagingBBox null>>setpagedevice"
+*PageRegion w100h150/100 x 150 mm Label: "<</PageSize[283.46 425.20]/ImagingBBox null>>setpagedevice"
+*PageRegion w100h180/100 x 180 mm Label: "<</PageSize[283.46 510.24]/ImagingBBox null>>setpagedevice"
+*PageRegion A4/A4: "<</PageSize[595.28 841.89]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageRegion
+*DefaultImageableArea: w48h80
+*ImageableArea w48h80/48 x 80 mm Label: "0 0 136.06 226.77"
+*ImageableArea w60h80/60 x 80 mm Label: "0 0 170.08 226.77"
+*ImageableArea w80h100/80 x 100 mm Label: "0 0 226.77 283.46"
+*ImageableArea w100h150/100 x 150 mm Label: "0 0 283.46 425.20"
+*ImageableArea w100h180/100 x 180 mm Label: "0 0 283.46 510.24"
+*ImageableArea A4/A4: "0 0 595.28 841.89"
+*DefaultPaperDimension: w48h80
+*PaperDimension w48h80/48 x 80 mm Label: "136.06 226.77"
+*PaperDimension w60h80/60 x 80 mm Label: "170.08 226.77"
+*PaperDimension w80h100/80 x 100 mm Label: "226.77 283.46"
+*PaperDimension w100h150/100 x 150 mm Label: "283.46 425.20"
+*PaperDimension w100h180/100 x 180 mm Label: "283.46 510.24"
+*PaperDimension A4/A4: "595.28 841.89"
+
+*cupsManualCopies: True
+*DefaultOutputOrder: Normal
