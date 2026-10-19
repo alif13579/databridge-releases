@@ -1,0 +1,1467 @@
+#!/usr/bin/env python3
+"""DataBridge print host — native-messaging bridge to the SPRT TL5X label printer.
+
+Stdin/stdout protocol (Chrome native messaging): each message is a 4-byte
+little-endian length prefix followed by a UTF-8 JSON body.
+
+Requests:
+  {"action": "ping"}                                   -> {"ok": true, ...}
+  {"action": "print_label", consignment, customer,
+   phone, address, cod, branch, copies, device,
+   dry_run}                                            -> {"ok": true, ...}
+    dry_run=true builds the TSPL bytes but never touches the serial port
+    (safe to verify layout without spending a sticker).
+
+Only print_label opens the serial port. Everything else is side-effect free.
+Label: 48x80mm TSPL, Code128 barcode + ID/customer/phone/address/COD + QR.
+Built-in printer fonts are Latin-only — non-Latin text prints as '?'.
+"""
+import sys
+import os
+import json
+import struct
+import time
+
+
+def load_config():
+    """Per-machine overrides (e.g. Windows COM port): db-print-config.json
+    next to this script, e.g. {"device": "COM4"}. Missing = defaults."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "db-print-config.json"), encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(patch):
+    """Merge patch into the per-machine config file. Returns (ok, error)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "db-print-config.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+                if not isinstance(d, dict):
+                    d = {}
+        except Exception:
+            d = {}
+        d.update(patch)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        global CONFIG
+        CONFIG = d
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+CONFIG = load_config()
+DEVICE_DEFAULT = CONFIG.get("device") or CONFIG.get("bluetooth") or (
+    "/dev/cu.TL5XBTPrinter" if os.name != "nt" else "COM4"
+)
+
+
+def conn_type(dev):
+    """bluetooth vs cable, for the toast ('which printer printed?').
+    Explicit per-machine override wins (db-print-config.json {"conn": ...});
+    otherwise guessed from the device name."""
+    override = str(CONFIG.get("conn") or "").strip().lower()
+    if override in ("bluetooth", "bt"):
+        return "bluetooth"
+    if override in ("cable", "usb"):
+        return "cable"
+    d = str(dev or "").lower()
+    if "bluetooth" in d or "btprinter" in d:
+        return "bluetooth"
+    if "usb" in d or "cable" in d:
+        return "cable"
+    return "unknown"
+
+
+def stock_dims(p):
+    """Dynamic sticker size: payload width_mm/height_mm wins, else per-machine
+    config, else 48x80 (proved by the CALIB 48x80 photo). Returns
+    (w_mm, h_mm, W_dots, H_dots, align). Align: left/center/right."""
+    def num(v, default, lo, hi):
+        try:
+            f = float(v)
+            if f != f or f == float("inf") or f == float("-inf"):
+                return default
+            return max(lo, min(hi, int(round(f))))
+        except (TypeError, ValueError):
+            return default
+    w = num(p.get("width_mm", CONFIG.get("width_mm", 48)), 48, 30, 110)
+    h = num(p.get("height_mm", CONFIG.get("height_mm", 80)), 80, 20, 150)
+    a = str(p.get("align", CONFIG.get("align", "left")) or "left").strip().lower()
+    if a not in ("left", "center", "centre", "right"):
+        a = "left"
+    if a == "centre":
+        a = "center"
+    return w, h, w * 8, h * 8, a
+
+
+# TSPL built-in font dot widths (approx, x_mul=1): used to center TEXT.
+TSPL_FONT_W = {"1": 8, "2": 12, "3": 16, "4": 24, "5": 32}
+
+
+def stock_offset(p):
+    """Print-position fine tune in dots (signed): payload offset_x_mm /
+    offset_y_mm wins, else per-machine config, else 0. +x = right, +y = down
+    (negative y moves content up — for printers that feed extra top space).
+    Range clamped to ±20mm so a typo can't throw content off-stock."""
+    def mm(v):
+        try:
+            f = float(v)
+            if f != f or f == float("inf") or f == float("-inf"):
+                return 0
+            return max(-20, min(20, int(round(f * 8))))
+        except (TypeError, ValueError):
+            return 0
+    ox = mm(p.get("offset_x_mm", CONFIG.get("offset_x_mm", 0)))
+    oy = mm(p.get("offset_y_mm", CONFIG.get("offset_y_mm", 0)))
+    return ox, oy
+
+
+def border_on(p):
+    """Per-print 'border' payload wins; else per-machine config key."""
+    if isinstance(p, dict) and "border" in p:
+        v = p.get("border")
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "on", "yes")
+    return bool(CONFIG.get("border", False))
+
+
+def border_line(W, H):
+    """Calibration frame: 1mm inset from every edge, 3-dot pen. Makes the
+    true printable rectangle visible on every sticker so margins can be
+    judged against the physical die-cut and corrected via offsets."""
+    ins = 8
+    return "BOX %d,%d,%d,%d,3" % (ins, ins, max(2, W - ins * 2), max(2, H - ins * 2))
+
+
+def apply_offset(tspl, ox, oy):
+    """Shift a built TEXT-path TSPL job by (ox, oy) dots. Covers TEXT,
+    BARCODE, QRCODE, BAR and BITMAP origins; coordinates clamp at 0 so a
+    big negative offset clips at the edge instead of emitting invalid TSPL.
+    BITMAP *pixels* are shifted separately in pages_to_tspl."""
+    import re
+    if not ox and not oy:
+        return tspl
+    def shift(m):
+        cmd, x, y = m.group(1), int(m.group(2)) + ox, int(m.group(3)) + oy
+        return "%s %d,%d" % (cmd, max(0, x), max(0, y))
+    # NB: BITMAP origins stay 0,0 — bitmap *pixels* are pre-shifted in
+    # pages_to_tspl, so moving the origin as well would double-shift.
+    return re.sub(r"\b(TEXT|BARCODE|QRCODE|BAR|BOX) (\d+),(\d+)",
+                  shift, tspl.decode("ascii", errors="replace")).encode("ascii", errors="replace")
+
+
+def shift_page(im, ox, oy):
+    """Shift a 1-bit page image by (ox, oy) dots on a white canvas of the
+    same size (negative = crop that edge, exposed area stays white)."""
+    if not ox and not oy:
+        return im
+    from PIL import Image as _I
+    W, H = im.size
+    cv = _I.new("L", (W, H), 255)
+    try:
+        cv.paste(im, (ox, oy))
+    except Exception:
+        pass
+    return cv
+
+
+def text_x(text, font, W, align, margin=12):
+    """X for a TSPL TEXT so left/center/right align inside W dots."""
+    if align == "center":
+        tw = len(str(text or "")) * TSPL_FONT_W.get(str(font), 12)
+        return max(margin, (W - tw) // 2)
+    if align == "right":
+        tw = len(str(text or "")) * TSPL_FONT_W.get(str(font), 12)
+        return max(margin, W - margin - tw)
+    return margin
+
+
+def barcode_fit(cid, W, align, margin=3):
+    """(x, narrow) for a Code128 barcode with safe edge clearance.
+
+    Margin bug fixed: a 14-char ID at narrow=2 is ~378 dots — on a 384-dot
+    stock starting at x=6 it ended exactly at dot 384 (zero right margin,
+    any printer tolerance clipped it). Now x shifts left to keep `margin`
+    dots of clearance (14-char → x=3, ends at 381), and only long IDs fall
+    back to narrow=1. narrow=2 stays preferred — this TL5X prints narrow=1
+    faintly, so we keep 2 whenever it fits.
+    """
+    cid = str(cid or "")
+    for narrow in (2, 1):
+        bw = (11 * len(cid) + 35) * narrow
+        room = W - margin * 2 - bw
+        if room < 0:
+            continue  # doesn't fit even edge-to-edge minus margins
+        if align == "center":
+            return max(margin, (W - bw) // 2), narrow
+        if align == "right":
+            return max(margin, W - margin - bw), narrow
+        # left: keep historic x≈6..12 but never cross the right margin
+        return max(margin, min(12, W - margin - bw)), narrow
+    # Pathological ID (still too long at narrow=1): pin left, let it clip
+    # rather than go negative — caller truncates the human-readable text.
+    return margin, 1
+
+
+def barcode_x(cid, W, align, narrow=2, margin=6):
+    """Back-compat wrapper (tests / old callers). Prefers narrow=2 fit."""
+    x, _ = barcode_fit(cid, W, align, margin=margin)
+    return x
+
+
+def qr_size(cell=4):
+    """Approx QR side in dots for a short consignment ID (v1 ≈ 21 modules)."""
+    return (21 + 8) * cell
+
+
+def qr_x(W, align, cell=4, margin=12):
+    s = qr_size(cell)
+    if align == "center":
+        return max(margin, (W - s) // 2)
+    if align == "right":
+        return max(margin, W - margin - s)
+    return margin
+
+
+def bar_w(W, margin=12):
+    return max(100, W - margin * 2)
+
+
+def bar_x(W, align, margin=12):
+    """X for a full-width BAR rule honoring the sticker align."""
+    bw = bar_w(W, margin)
+    if align == "center":
+        return max(margin, (W - bw) // 2)
+    if align == "right":
+        return max(margin, W - margin - bw)
+    return margin
+
+
+def vscale(H, base=640):
+    """Vertical scaler: layouts are authored for 80mm (640 dots); on taller
+    stock (e.g. 115mm) y positions spread proportionally so the design keeps
+    its proportions instead of bunching at the top. H=640 → identity."""
+    return lambda y: int(y * H / base)
+
+
+def wrap_chars_for(W, font="2", margin=12):
+    """Address wrap width that fills the stock (was fixed 30 chars =
+    full-bleed on 48mm but a narrow column on 85mm)."""
+    fw = TSPL_FONT_W.get(font, 12)
+    return max(30, (W - margin * 2) // fw)
+
+
+def discover_printers():
+    """All candidate label printers as [(device, conn)], cable FIRST then
+    bluetooth — cable always gets priority when both are plugged in.
+    Unknown devices are skipped (never poke random hardware)."""
+    found = []
+    try:
+        if os.name == "nt":
+            from serial.tools import list_ports
+            for p in list_ports.comports():
+                desc = ((p.description or "") + " " + (p.device or "")).lower()
+                if "usb" in desc:
+                    found.append((p.device, "cable"))
+                elif "bluetooth" in desc:
+                    found.append((p.device, "bluetooth"))
+        else:
+            import glob
+            cands = sorted(glob.glob("/dev/cu.*") + glob.glob("/dev/ttyUSB*") +
+                           glob.glob("/dev/ttyACM*") + glob.glob("/dev/rfcomm*"))
+            for dev in cands:
+                base = os.path.basename(dev).lower()
+                if "incoming" in base:
+                    continue  # macOS Bluetooth-Incoming-Port listener, not a printer
+                if "usb" in base or "acm" in base:
+                    found.append((dev, "cable"))
+                elif "bluetooth" in base or "btprinter" in base or "rfcomm" in base:
+                    found.append((dev, "bluetooth"))
+    except Exception:
+        pass
+    found.sort(key=lambda x: 0 if x[1] == "cable" else 1)
+    return found
+BAUDS = [115200, 9600]
+HOST_VERSION = 1
+
+
+def read_msg():
+    raw_len = sys.stdin.buffer.read(4)
+    if len(raw_len) < 4:
+        return None
+    (ln,) = struct.unpack("<I", raw_len)
+    if ln <= 0 or ln > 1024 * 1024:
+        return None
+    data = sys.stdin.buffer.read(ln)
+    if len(data) < ln:
+        return None
+    return json.loads(data.decode("utf-8"))
+
+
+def write_msg(obj):
+    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(data)))
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def tspl_text(s, n):
+    return str(s or "").replace('"', "'").replace("\n", " ").strip()[:n]
+
+
+def wrap(s, width, max_lines=2):
+    """Word-wrap that RESPECTS the user's own newlines: each paragraph wraps
+    separately, blank lines stay blank. So typed line breaks print as-is."""
+    out = []
+    for para in str(s or "").split("\n"):
+        words = para.split()
+        if not words:
+            out.append("")
+        else:
+            lines, cur = [], ""
+            for w in words:
+                trial = (cur + " " + w).strip()
+                if len(trial) <= width:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            out.extend(lines)
+        if len(out) >= max_lines:
+            break
+    return out[:max_lines]
+
+
+def wrap2(s, width):
+    """Exactly 2 lines (address fields) — pads short text, truncates long."""
+    return (wrap(s, width, max_lines=2) + ["", ""])[:2]
+
+
+def render_margin_test_pages(W=384, H=640, w_mm=48, h_mm=80):
+    """Full-bleed edge-cut test: nested borders at 0/3/6/12 dots + side
+    labels on all four sides. One print shows exactly which edge clips:
+    - outer (0-dot) border fully visible = zero clipping on that side
+    - outer clipped but 3-dot visible = ~0.4mm cut, etc.
+    Labels sit inside the 12-dot line so they stay readable even when the
+    outer borders clip."""
+    from PIL import Image, ImageDraw
+    img = Image.new("L", (W, H), 255)
+    dr = ImageDraw.Draw(img)
+    # nested inset guides: 0 (edge), 3, 6, 12 dots
+    dr.rectangle([0, 0, W - 1, H - 1], outline=0, width=2)
+    dr.rectangle([3, 3, W - 4, H - 4], outline=0, width=1)
+    dr.rectangle([6, 6, W - 7, H - 7], outline=0, width=1)
+    dr.rectangle([12, 12, W - 13, H - 13], outline=0, width=2)
+    fbig = font_for(24, True, False)
+    f = font_for(18, True, False)
+    fsmall = font_for(16, False, False)
+
+    def ct(y, text, font):
+        try:
+            tw = dr.textlength(text, font=font)
+        except Exception:
+            tw = len(text) * 10
+        dr.text((max(14, (W - tw) // 2), y), text, font=font, fill=0)
+
+    ct(16, "TOP", f)
+    ct(H - 44, "BOTTOM", f)
+    ct(44, "%dx%d" % (w_mm, h_mm), fbig)
+    ct(72, "MARGIN TEST", f)
+    # LEFT / RIGHT labels (horizontal, inside the safe zone)
+    try:
+        dr.text((16, H // 2 - 10), "LEFT", font=f, fill=0)
+        rlab = "RIGHT"
+        rtw = dr.textlength(rlab, font=f)
+        dr.text((W - 16 - rtw, H // 2 - 10), rlab, font=f, fill=0)
+    except Exception:
+        pass
+    # tick numbers along top (x) and left (y) edges
+    for x in range(0, W, 48):
+        dr.line([(x, 0), (x, 8)], fill=0, width=2)
+        try:
+            dr.text((x + 2, 96), str(x), font=fsmall, fill=0)
+        except Exception:
+            pass
+    for y in range(0, H, 80):
+        dr.line([(0, y), (8, y)], fill=0, width=2)
+        dr.line([(W - 1, y), (W - 9, y)], fill=0, width=2)
+        try:
+            dr.text((20, y + 4), str(y), font=fsmall, fill=0)
+            ylab = str(y)
+            ytw = dr.textlength(ylab, font=fsmall)
+            dr.text((W - 24 - ytw, y + 4), ylab, font=fsmall, fill=0)
+        except Exception:
+            pass
+    # inset markers: which guide line is which
+    try:
+        dr.text((W - 60, 16), "0/3/6/12", font=fsmall, fill=0)
+        dr.text((W - 60, H - 64), "0/3/6/12", font=fsmall, fill=0)
+    except Exception:
+        pass
+    # thin center cross (does not touch any edge)
+    dr.line([(W // 2, 120), (W // 2, H - 120)], fill=0, width=1)
+    return [img]
+
+
+def render_width_test_pages(W=680, w_mm=85):
+    """Max-print-width finder: one short sticker (40mm tall) with a numbered
+    ruler across the full Settings width. Wherever the print STOPS = the
+    print-head limit (e.g. numbers stop at 48 = 48mm head). Heavy lines at
+    the 48mm and 80mm marks for instant reading."""
+    from PIL import Image, ImageDraw
+    H = 320  # 40mm — short, saves paper
+    img = Image.new("L", (W, H), 255)
+    dr = ImageDraw.Draw(img)
+    dr.rectangle([0, 0, W - 1, H - 1], outline=0, width=2)
+    fbig = font_for(28, True, False)
+    f = font_for(20, True, False)
+    fsmall = font_for(16, False, False)
+    try:
+        title = "WIDTH TEST %dmm" % w_mm
+        tw = dr.textlength(title, font=fbig)
+        dr.text(((W - tw) // 2, 8), title, font=fbig, fill=0)
+    except Exception:
+        pass
+    # mm ruler: line every 10mm (80 dots), numbered top + bottom
+    for mm in range(0, w_mm + 1, 10):
+        x = mm * 8
+        if x >= W:
+            break
+        dr.line([(x, 0), (x, H - 1)], fill=0, width=2)
+        lab = str(mm)
+        try:
+            dr.text((x + 4, 48), lab, font=f, fill=0)
+            btw = dr.textlength(lab, font=f)
+            dr.text((x + 4, H - 76), lab, font=f, fill=0)
+            # dot count underneath (exact cutoff reading)
+            dots = str(x)
+            dr.text((x + 4, H - 44), dots, font=fsmall, fill=0)
+        except Exception:
+            pass
+    # landmark lines: 48mm (384 dots) and 80mm (640 dots)
+    for mark_mm, tag in ((48, "48mm"), (80, "80mm")):
+        x = mark_mm * 8
+        if 0 < x < W:
+            dr.line([(x, 0), (x, H - 1)], fill=0, width=4)
+            try:
+                dr.text((x - 74, 100), tag, font=fbig, fill=0)
+            except Exception:
+                pass
+    # dot ticks every 48 across the top (fine-grained cutoff)
+    for x in range(0, W, 48):
+        dr.line([(x, 0), (x, 14)], fill=0, width=2)
+    return [img]
+
+
+def build_bitmap_sticker(p):
+    """Full-stock bitmap rasterization of a pathao/std sticker — bypasses the
+    flaky built-in TEXT/QRCODE firmware path entirely: every glyph is drawn
+    by PIL (config border on = the calibration frame prints), the barcode
+    stays NATIVE TSPL (that path is proven reliable), QR via the `qrcode`
+    lib when it is installed (else clean skip). Content rests inside a
+    3mm inset on all four sides — equal margins no matter the label size,
+    and the declared page still equals the true stock so pagination syncs
+    ( cannon rule: SIZE+GAP must equal label+gap, content never fills)."""
+    from PIL import Image, ImageDraw
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    ins = 24                       # 3mm breathing margin on every side
+    canvas = Image.new("L", (W, H), 255)
+    dr = ImageDraw.Draw(canvas)
+    if border_on(p):
+        dr.rectangle([ins, ins, W - ins, H - ins], outline=0, width=3)
+    k = (H - 2 * ins) / 640.0      # design rows authored on a 0..640 grid
+    L, R = ins + 6, W - ins - 6
+    def S(y):
+        return int(ins + y * k)
+    def fs(sz):
+        return int(round(sz * k))
+    def cx():
+        return (ins + W - ins) // 2
+    def place(y, s, size, bold=False):
+        if not s:
+            return
+        f = font_for(fs(size), bold, False)
+        if align == "center":
+            dr.text((cx(), S(y)), s, font=f, fill=0, anchor="mm")
+        elif align == "right":
+            dr.text((R, S(y)), s, font=f, fill=0, anchor="rm")
+        else:
+            dr.text((L, S(y)), s, font=f, fill=0, anchor="lm")
+    def hline(y):
+        dr.line([(ins, S(y)), (W - ins, S(y))], fill=0, width=2)
+    cid = tspl_text(p.get("consignment"), 20)
+    place(16, "PATHAO", 26, True)
+    place(56, cid, 24, True)
+    place(172, tspl_text(p.get("customer"), 30), 22, True)
+    place(212, tspl_text(p.get("phone"), 20), 15)
+    aw = wrap_chars_for(W)
+    addr_lines = (wrap(tspl_text(p.get("address"), aw * 3), aw, max_lines=3) + ["", "", ""])[:3]
+    for i, ln in enumerate(addr_lines):
+        place(244 + i * 30, ln, 15)
+    place(360, "COD Tk %s" % (tspl_text(p.get("cod"), 12) or "0"), 22, True)
+    place(428, tspl_text(p.get("branch") or p.get("hub"), 24), 22, True)
+    import datetime
+    place(468, datetime.date.today().strftime("%d-%b-%y"), 14)
+    # QR (bitmap) — 96-dot square, centered, if the qrcode lib is present.
+    qr_obj = None
+    if cid:
+        try:
+            import qrcode
+            qr = qrcode.QRCode(box_size=2, border=1,
+                               error_correction=qrcode.constants.ERROR_CORRECT_L)
+            qr.add_data(cid); qr.make(fit=True)
+            qr_obj = qr.make_image(fill_color="black", back_color="white")
+        except Exception:
+            qr_obj = None
+    if qr_obj is not None:
+        try:
+            qsize = 96
+            qimg = qr_obj.get_image().convert("L").resize((qsize, qsize), Image.LANCZOS)
+            canvas.paste(qimg, (cx() - qsize // 2, S(496)), qimg.point(lambda v: 255 if v > 128 else 0))
+            place(612, cid, 13)
+        except Exception:
+            pass
+    else:
+        place(560, cid, 13)
+    hline(344)
+    hline(412)
+    narrow = max(2, barcode_fit(cid, W - 2 * ins, align)[1] or 2)
+    bar_y = S(96)
+    bar_x = (W - min(W - 2 * ins, len(cid) * 13 * narrow)) // 2
+    out = [("SIZE %d mm, %d mm" % (w_mm, h_mm)).encode(),
+           b"GAP 2 mm, 0", b"DIRECTION 1", b"CLS",
+           pyt(canvas, w_mm, h_mm),
+           ('BARCODE %d,%d,"128",%d,1,0,%d,%d,"%s"'
+            % (bar_x, bar_y, int(64 * k), narrow, narrow, cid)).encode(),
+           b"PRINT 1,1"]
+    return b"\r\n".join(out) + b"\r\n"
+
+
+def pyt(canvas, w_mm, h_mm):
+    """Single-page BITMAP TSPL chunk (no SIZE/CLS/PRINT) — bytes for one
+    raster regardless of the caller's surrounding commands."""
+    W, H = canvas.size
+    px = canvas.convert("L").load()
+    row_bytes = W // 8
+    buf = bytearray()
+    for yy in range(H):
+        for xb in range(row_bytes):
+            b = 0
+            for bit in range(8):
+                if px[xb * 8 + bit, yy] >= 128:
+                    b |= 0x80 >> bit
+            buf.append(b)
+    return ("BITMAP 0,0,%d,%d,0," % (row_bytes, H)).encode() + bytes(buf)
+
+
+def build_tspl(p):
+    tpl = (p.get("template") or "pathao")
+    if tpl in ("pathao", "std") and (p.get("render") or CONFIG.get("render", "bitmap")) == "bitmap":
+        return build_bitmap_sticker(p)
+    if tpl == "run":
+        return build_run_tspl(p)
+    if tpl == "margins":
+        w_mm, h_mm, W, H, _al = stock_dims(p)
+        ox, oy = stock_offset(p)
+        return pages_to_tspl(render_margin_test_pages(W, H, w_mm, h_mm),
+                             h_mm=h_mm, w_mm=w_mm, ox=ox, oy=oy)
+    if tpl == "widthtest":
+        w_mm, _h_mm, W, _H, _al = stock_dims(p)
+        ox, oy = stock_offset(p)
+        return pages_to_tspl(render_width_test_pages(W, w_mm),
+                             h_mm=40, w_mm=w_mm, ox=ox, oy=oy)
+    if tpl == "calibrate":
+        cpages, ch_mm = render_calibrate_pages()
+        ox, oy = stock_offset(p)
+        return pages_to_tspl(cpages, h_mm=ch_mm, ox=ox, oy=oy)
+    if tpl in ("note", "letter"):
+        return build_note_tspl(p)
+    if tpl == "pathao":
+        return build_pathao_tspl(p)
+    return build_std_tspl(p)
+
+
+def render_calibrate_pages():
+    """Full-label numbered ruler (384x640 = 48x80mm). Covers the whole stock
+    so one photo maps the true printable area: report which numbers/lines
+    land on the label edges."""
+    from PIL import Image, ImageDraw
+    W, H = 384, 640
+    img = Image.new("L", (W, H), 255)
+    dr = ImageDraw.Draw(img)
+    dr.rectangle([0, 0, W - 1, H - 1], outline=0, width=2)
+    f = font_for(16, False, False)
+    fbig = font_for(24, True, False)
+    for x in range(0, W, 48):
+        dr.text((x + 2, 4), str(x), font=f, fill=0)
+        dr.line([(x, 0), (x, 10)], fill=0, width=2)
+    for y in range(0, H, 40):
+        dr.text((2, y + 2), str(y), font=f, fill=0)
+        dr.line([(0, y), (10, y)], fill=0, width=2)
+        dr.text((W - 32, y + 2), str(y), font=f, fill=0)
+        dr.line([(W - 1, y), (W - 11, y)], fill=0, width=2)
+    # mm reference lines: where 30mm and 40mm end (240 / 320 dots)
+    for mm, yy in (("30mm LINE", 240), ("40mm LINE", 320)):
+        dr.line([(0, yy), (W - 1, yy)], fill=0, width=1)
+        dr.text((W // 2 - 70, yy + 4), mm, font=fbig, fill=0)
+    dr.text((W // 2 - 95, H // 2 - 20), "CALIB 48x80", font=fbig, fill=0)
+    return [img], 80
+
+
+def build_note_tspl(p):
+    """Rich note sticker. PIL renderer (bold/head/columns/orientation, later
+    Bangla/logo) when Pillow exists; plain TSPL-text fallback otherwise.
+    Honors width_mm/height_mm/align for full customisation."""
+    try:
+        from PIL import Image  # noqa: F401 - availability check
+    except ImportError:
+        return build_note_tspl_text(p)
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    pages = render_note_pages(p.get("title"), p.get("body"),
+                              note_orientation(p),
+                              letter=((p.get("from"), p.get("to"))
+                                      if (p.get("template") or "") == "letter" else None),
+                              W=W, H=H, align=align)
+    ox, oy = stock_offset(p)
+    return pages_to_tspl(pages, h_mm=h_mm, w_mm=w_mm, ox=ox, oy=oy)
+
+
+LATIN_FONTS = [
+    ("/System/Library/Fonts/Helvetica.ttc", 0),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", 0),
+    ("C:\\Windows\\Fonts\\arial.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+]
+LATIN_BOLD_FONTS = [
+    ("/System/Library/Fonts/Helvetica.ttc", 1),
+    ("C:\\Windows\\Fonts\\arialbd.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
+]
+BANGLA_FONTS = [
+    ("/System/Library/Fonts/KohinoorBangla.ttc", 0),
+    ("C:\\Windows\\Fonts\\Nirmala.ttf", 0),
+    ("/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf", 0),
+]
+BANGLA_BOLD_FONTS = [
+    ("/System/Library/Fonts/KohinoorBangla.ttc", 1),
+    ("C:\\Windows\\Fonts\\NirmalaB.ttf", 0),
+    ("/usr/share/fonts/truetype/noto/NotoSansBengali-Bold.ttf", 0),
+]
+_font_cache = {}
+
+
+def has_bengali(s):
+    return any("\u0980" <= ch <= "\u09FF" for ch in str(s or ""))
+
+
+def font_for(size, bold, bengali):
+    key = (size, bold, bengali)
+    if key in _font_cache:
+        return _font_cache[key]
+    cands = []
+    if bengali:
+        cands += BANGLA_BOLD_FONTS if bold else BANGLA_FONTS
+    if bold:
+        cands += LATIN_BOLD_FONTS
+    cands += LATIN_FONTS
+    f = None
+    for path, idx in cands:
+        try:
+            f = __import__("PIL.ImageFont", fromlist=["truetype"]).truetype(path, size, index=idx)
+            break
+        except Exception:
+            pass
+        if idx == 0:
+            try:
+                f = __import__("PIL.ImageFont", fromlist=["truetype"]).truetype(path, size)
+                break
+            except Exception:
+                pass
+    if f is None:
+        try:
+            from PIL import ImageFont
+            try:
+                f = ImageFont.load_default(size=size)
+            except TypeError:
+                f = ImageFont.load_default()
+        except Exception:
+            f = None
+    _font_cache[key] = f
+    return f
+
+
+def parse_note_markup(title, body):
+    """Blocks: ('head', text) | ('cols', left, right) | ('segs', [(text, bold)]).
+    Markup: '# head', 'left | right', '*bold*'. Unmatched '*' = literal."""
+    blocks = []
+    if (title or "").strip():
+        blocks.append(("head", title.strip()))
+    for raw in str(body or "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            t = line.lstrip("#").strip()
+            if t:
+                blocks.append(("head", t))
+            continue
+        if "|" in line:
+            l, r = line.split("|", 1)
+            blocks.append(("cols", l.strip(), r.strip()))
+            continue
+        segs, buf, bold = [], "", False
+        for ch in line:
+            if ch == "*":
+                if buf:
+                    segs.append((buf, bold))
+                    buf = ""
+                bold = not bold
+            else:
+                buf += ch
+        if buf:
+            segs.append((buf, bold))
+        if segs:
+            blocks.append(("segs", segs))
+    return blocks
+
+
+def render_note_pages(title, body, orientation, letter=None, W=None, H=None, align="left"):
+    """Render note to 1-bit PIL pages (default 384x640 = 48x80mm). Landscape
+    renders tall then rotates onto the stock. Align left/center/right.
+    letter=(from,to): From/To two-column header above the body."""
+    from PIL import Image, ImageDraw
+    landscape = (orientation or "portrait") == "landscape"
+    if W is None or H is None:
+        W, H = 384, 640
+    if landscape:
+        # pre-rotate canvas so the post-rotate page is W x H
+        W, H = H, W
+    F_HEAD, F_NORM = 30, 21
+    pages = []
+    img = dr = None
+    y = 0
+
+    def new_page():
+        nonlocal img, dr, y
+        img = Image.new("L", (W, H), 255)  # L-mode: 0 black .. 255 white
+        dr = ImageDraw.Draw(img)
+        y = 6
+        pages.append(img)
+
+    def need(h):
+        if y + h > H - 4:
+            new_page()
+
+    def text_w(text, size, bold):
+        f = font_for(size, bold, has_bengali(text))
+        try:
+            return dr.textlength(text, font=f)
+        except Exception:
+            return len(text) * size * 0.6
+
+    def put(x, yy, text, size, bold):
+        f = font_for(size, bold, has_bengali(text))
+        if f is None:
+            return
+        try:
+            dr.text((x, yy), text, font=f, fill=0)
+        except Exception:
+            pass
+
+    def ax(text, size, bold):
+        """X honoring the sticker align (middle print = center)."""
+        if align == "left":
+            return 8
+        try:
+            tw = dr.textlength(text, font=font_for(size, bold, has_bengali(text)))
+        except Exception:
+            tw = len(str(text or "")) * size * 0.6
+        if align == "center":
+            return max(8, int((W - tw) // 2))
+        return max(8, int(W - 8 - tw))
+
+    def colx(text, size, bold, x0, x1):
+        """X for two-column blocks (FROM/TO, a|b): left keeps the old edge
+        positions; center middle-aligns each column inside its half; right
+        pushes each column to its half's right edge."""
+        if align == "left":
+            return x0
+        try:
+            tw = dr.textlength(text, font=font_for(size, bold, has_bengali(text)))
+        except Exception:
+            tw = len(str(text or "")) * size * 0.6
+        if align == "center":
+            return max(x0, int(x0 + (x1 - x0 - tw) // 2))
+        return max(x0, int(x1 - tw))
+
+    new_page()
+    blocks = []
+    if letter and ((letter[0] or "").strip() or (letter[1] or "").strip()):
+        # Letter order: title on TOP, then From/To columns, then the body.
+        if (title or "").strip():
+            blocks.append(("head", title.strip()))
+        blocks.append(("fromto", wrap(letter[0], 40, max_lines=3),
+                       wrap(letter[1], 40, max_lines=3)))
+        blocks += [b for b in parse_note_markup("", body)]
+    else:
+        blocks += parse_note_markup(title, body)
+    for blk in blocks:
+        if len(pages) >= 6:
+            break
+        if blk[0] == "head":
+            need(F_HEAD + 8)
+            t = blk[1][:40]
+            put(ax(t, F_HEAD, True), y, t, F_HEAD, True)
+            y += F_HEAD + 8
+        elif blk[0] == "cols":
+            need(F_NORM + 8)
+            half = W // 2
+            lt = blk[1][: (half - 12) // 11]
+            rt = blk[2][: (W - half - 12) // 11]
+            put(colx(lt, F_NORM, False, 8, half - 4), y, lt, F_NORM, False)
+            put(colx(rt, F_NORM, False, half + 4, W - 8), y, rt, F_NORM, False)
+            y += F_NORM + 8
+        elif blk[0] == "fromto":
+            # Narrow stock (landscape) gets a smaller font so addresses fit.
+            fs = 16 if W < 300 else F_NORM
+            cw = max(8, int((W // 2 - 16) / (fs * 0.55)))
+            need(fs + 8)
+            half = W // 2
+            put(colx("FROM", fs, True, 8, half - 4), y, "FROM", fs, True)
+            put(colx("TO", fs, True, half + 4, W - 8), y, "TO", fs, True)
+            y += fs + 8
+            flines, tlines = blk[1], blk[2]
+            for i in range(max(len(flines), len(tlines))):
+                if len(pages) >= 6:
+                    break
+                need(fs + 6)
+                if i < len(flines):
+                    fl = flines[i][:cw]
+                    put(colx(fl, fs, False, 8, half - 4), y, fl, fs, False)
+                if i < len(tlines):
+                    tl = tlines[i][:cw]
+                    put(colx(tl, fs, False, half + 4, W - 8), y, tl, fs, False)
+                y += fs + 6
+            need(10)
+            try:
+                dr.line([(8, y + 2), (W - 8, y + 2)], fill=0, width=2)
+            except Exception:
+                pass
+            y += 10
+        else:
+            # flatten to words, greedy-fill by pixel width
+            words = []
+            for text, bold in blk[1]:
+                for w in text.split(" "):
+                    words.append((w, bold))
+            max_w = W - 16
+            cur = []
+            cur_w = 0
+            lines = []
+
+            def flush():
+                if cur:
+                    lines.append(cur[:])
+
+            for w, bold in words:
+                if not w:
+                    continue
+                ww = text_w(w + " ", F_NORM, bold)
+                if cur and cur_w + ww > max_w:
+                    flush()
+                    cur, cur_w = [], 0
+                    ww = text_w(w + " ", F_NORM, bold)
+                cur.append((w, bold))
+                cur_w += ww
+            flush()
+            for segs in lines:
+                if len(pages) >= 6:
+                    break
+                need(F_NORM + 6)
+                try:
+                    line_w = sum(text_w(w + " ", F_NORM, b) for w, b in segs)
+                except Exception:
+                    line_w = 0
+                if align == "center":
+                    x = max(8, int((W - line_w) // 2))
+                elif align == "right":
+                    x = max(8, int(W - 8 - line_w))
+                else:
+                    x = 8
+                for i, (w, bold) in enumerate(segs):
+                    put(x, y, w, F_NORM, bold)
+                    x += text_w(w + " ", F_NORM, bold)
+                y += F_NORM + 6
+    if landscape:
+        pages = [im.rotate(-90, expand=True) for im in pages]
+    return pages
+
+
+def pil_to_b64(im, max_w=384):
+    """PIL image -> base64 PNG data URL piece (no file read needed by the
+    extension). Downscales wide images so the preview stays small."""
+    import base64
+    import io
+    try:
+        w, h = im.size
+        if w > max_w:
+            im = im.resize((max_w, int(h * max_w / w)))
+        buf = io.BytesIO()
+        im.convert("L").save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def render_parcel_preview(p):
+    """Approx preview of the TSPL parcel/run sticker as a PIL image (same
+    SIZE + align as the real print). Layout mirrors build_pathao/std/run so
+    what you see is what prints — without spending a sticker."""
+    from PIL import Image, ImageDraw
+    tpl = (p.get("template") or "pathao")
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    S = vscale(H)  # same vertical spread as the TSPL builders
+    img = Image.new("L", (W, H), 255)
+    dr = ImageDraw.Draw(img)
+    dr.rectangle([0, 0, W - 1, H - 1], outline=0, width=2)
+
+    def tx(yb, text, size, bold=False):
+        # yb is the EXACT base-space y from the TSPL builders below, so the
+        # preview lands where the real print lands.
+        y = S(yb)
+        f = font_for(size, bold, has_bengali(text))
+        if f is None:
+            return
+        try:
+            tw = dr.textlength(text, font=f)
+        except Exception:
+            tw = len(text) * size * 0.6
+        if align == "center":
+            x = max(4, int((W - tw) // 2))
+        elif align == "right":
+            x = max(4, int(W - 4 - tw))
+        else:
+            x = 8
+        try:
+            dr.text((x, y), text, font=f, fill=0)
+        except Exception:
+            pass
+
+    def bars(yb, label, h=64):
+        # fake barcode: alternating bars (same height as the TSPL barcode)
+        y = S(yb)
+        bw = min(W - 16, max(120, len(label) * 12))
+        x0 = 8 if align == "left" else (W - 8 - bw if align == "right" else (W - bw) // 2)
+        for i in range(0, bw, 4):
+            dr.rectangle([x0 + i, y, x0 + i + 2, y + h], fill=0)
+        return yb
+
+    def rule(yb):
+        dr.line([(8, S(yb)), (W - 8, S(yb))], fill=0, width=2)
+
+    def qrbox(yb, label):
+        # Stacked to mirror the TSPL (QR above its caption — side-by-side
+        # overflowed on center/right). Cell ~3 => ~87 dots for short IDs.
+        y = S(yb)
+        s = min(87, H - y - 32)
+        if s < 40:
+            return H
+        x0 = 8 if align == "left" else (W - 8 - s if align == "right" else (W - s) // 2)
+        dr.rectangle([x0, y, x0 + s, y + s], outline=0, width=2)
+        dr.line([(x0, y), (x0 + s, y + s)], fill=0, width=1)
+        dr.line([(x0 + s, y), (x0, y + s)], fill=0, width=1)
+        # No caption here — the TSPL caption is drawn separately at base
+        # y=590/578 (see tx() calls below), same as the real print.
+        return  # terminal block
+
+    # Base-space y values are copied 1:1 from build_run/pathao/std_tspl above,
+    # so the preview shows the real positions (only barcode/QR glyphs differ).
+    if tpl == "run":
+        tx(16, tspl_text(p.get("consignment"), 20) or "ID", 24, True)
+        bars(56, tspl_text(p.get("consignment"), 20), h=72)
+        tx(148, tspl_text(p.get("status"), 24) or "Status", 28, True)
+        tx(212, tspl_text(p.get("run"), 30) or "Run", 22)
+        tx(264, tspl_text(p.get("hub"), 30), 22)
+        tx(316, tspl_text(p.get("date"), 20), 20)
+        rule(368)
+        tx(384, tspl_text(p.get("run"), 30) or "Run", 22)
+    elif tpl == "std":
+        tx(16, tspl_text(p.get("consignment"), 20) or "ID", 24, True)
+        bars(56, tspl_text(p.get("consignment"), 20), h=64)
+        tx(140, tspl_text(p.get("customer"), 30), 22)
+        tx(188, tspl_text(p.get("phone"), 20), 20)
+        _aw0 = wrap_chars_for(W)
+        _al0 = (wrap(tspl_text(p.get("address"), _aw0 * 3), _aw0, max_lines=3) + ["", "", ""])[:3]
+        for _i0, _ln0 in enumerate(_al0):
+            if _ln0:
+                tx(220 + _i0 * 32, _ln0, 20)
+        rule(324)
+        _cod0 = tspl_text(p.get("cod"), 12)
+        if _cod0:
+            tx(336, "COD Tk %s" % _cod0, 28, True)
+        rule(392)
+        tx(404, tspl_text(p.get("branch") or p.get("hub"), 24), 22)
+        tx(452, tspl_text(p.get("consignment"), 20), 20)
+        qrbox(484, tspl_text(p.get("consignment"), 20))
+        if _cod0:
+            tx(578, "COD Tk %s" % _cod0, 20)
+    else:
+        if tpl == "pathao":
+            tx(12, "PATHAO", 28, True)
+        tx(56, tspl_text(p.get("consignment"), 20) or "ID", 24, True)
+        bars(92, tspl_text(p.get("consignment"), 20), h=64)
+        tx(172, tspl_text(p.get("customer"), 30), 22)
+        tx(212, tspl_text(p.get("phone"), 20), 20)
+        _aw = wrap_chars_for(W)
+        _alines = (wrap(tspl_text(p.get("address"), _aw * 3), _aw, max_lines=3) + ["", "", ""])[:3]
+        for _i, _ln in enumerate(_alines):
+            if _ln:
+                tx(244 + _i * 32, _ln, 20)
+        rule(344)
+        cod = tspl_text(p.get("cod"), 12) or "0"
+        tx(356, "COD Tk %s" % cod, 28, True)
+        rule(412)
+        hub = tspl_text(p.get("branch") or p.get("hub"), 24)
+        if hub:
+            tx(424, hub, 22)
+        qrbox(496, tspl_text(p.get("consignment"), 20))
+        tx(590, tspl_text(p.get("consignment"), 20), 20)
+    return img
+
+
+def pages_to_tspl(pages, h_mm=80, w_mm=48, ox=0, oy=0):
+    """PIL pages -> TSPL BITMAP job. SIZE must match the rendered canvas
+    (dynamic width bug fixed: was hardcoded to 48mm wide). The offset is
+    applied to the *pixels* (see apply_offset) so the origin stays 0,0."""
+    out = [("SIZE %d mm, %d mm" % (w_mm, h_mm)).encode(),
+           b"GAP 2 mm, 0", b"DIRECTION 1", b"CLS"]
+    for im in pages:
+        W, H = im.size
+        target_w = max(240, w_mm * 8)  # 30mm->240 .. 80mm->640
+        if W != target_w:
+            im = im.resize((target_w, int(H * target_w / W)))
+            W, H = im.size
+        im = shift_page(im, ox, oy)
+        px = im.convert("L").load()
+        row_bytes = W // 8
+        buf = bytearray()
+        for yy in range(H):
+            for xb in range(row_bytes):
+                b = 0
+                for bit in range(8):
+                    if px[xb * 8 + bit, yy] >= 128:
+                        b |= 0x80 >> bit
+                buf.append(b)
+        out.append(("BITMAP 0,0,%d,%d,0," % (row_bytes, H)).encode() + bytes(buf))
+        out.append(b"PRINT 1,1")
+    return b"\r\n".join(out) + b"\r\n"
+
+
+def note_orientation(p):
+    """Explicit orientation wins; otherwise letter defaults to landscape."""
+    if p.get("orientation"):
+        return p.get("orientation")
+    return "landscape" if (p.get("template") or "") == "letter" else "portrait"
+
+
+def build_note_tspl_text(p):
+    """Fallback when Pillow is missing: plain-text note, dynamic SIZE + align."""
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    title = tspl_text(p.get("title"), 24) or "NOTE"
+    body_lines = wrap(tspl_text(p.get("body"), 600), 30, max_lines=40)
+    per_page = max(5, (H - 60) // 36)
+    pages, chunk = [], []
+    for ln in body_lines:
+        chunk.append(ln)
+        if len(chunk) == per_page:
+            pages.append(chunk)
+            chunk = []
+    if chunk or not pages:
+        pages.append(chunk)
+    out = ["SIZE %d mm, %d mm" % (w_mm, h_mm), "GAP 2 mm, 0", "DIRECTION 1"]
+    for page in pages:
+        out.append("CLS")
+        out.append('TEXT %d,8,"3",0,1,1,"%s"' % (text_x(title, "3", W, align), title))
+        y = 44
+        for ln in page:
+            out.append('TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(ln, "2", W, align), y, ln))
+            y += 36
+        out.append("PRINT 1,1")
+    return ("\r\n".join(out) + "\r\n").encode("ascii", errors="replace")
+
+
+def build_run_tspl(p):
+    """Run-page relabel sticker (default 48x80mm, dynamic SIZE + align).
+    Middle print = align center. Barcode keeps 4-dot edge clearance."""
+    import datetime
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    S = vscale(H)
+    cid = tspl_text(p.get("consignment"), 20)
+    status = tspl_text(p.get("status"), 24)
+    run = tspl_text(p.get("run"), 30)
+    hub = tspl_text(p.get("hub"), 30)
+    date = tspl_text(p.get("date"), 20) or datetime.date.today().strftime("%d-%b-%y")
+    bx, narrow = barcode_fit(cid, W, align)
+    bw = bar_w(W)
+    rx = bar_x(W, align)
+    lines = [
+        "SIZE %d mm, %d mm" % (w_mm, h_mm),
+        "GAP 2 mm, 0",
+        "DIRECTION 1",
+        "CLS",
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(16), cid),
+        'BARCODE %d,%d,"128",72,1,0,%d,%d,"%s"' % (bx, S(56), narrow, narrow, cid),
+        'TEXT %d,%d,"4",0,1,1,"%s"' % (text_x(status, "4", W, align), S(148), status),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(run, "3", W, align), S(212), run),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(hub, "3", W, align), S(264), hub),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(date, "2", W, align), S(316), date),
+        "BAR %d,%d,%d,2" % (rx, S(368), bw),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(run, "3", W, align), S(384), run),
+        'TEXT %d,%d,"4",0,1,1,"%s"' % (text_x(status, "4", W, align), S(440), status),
+        'TEXT %d,%d,"2",0,1,1,"%s %s"' % (text_x(hub + " " + date, "2", W, align), S(508), hub, date),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(544), cid),
+        "PRINT 1,1",
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode("ascii", errors="replace")
+
+
+def build_pathao_tspl(p):
+    """Pathao-style sticker (default 48x80mm, dynamic SIZE + align).
+    Margin-safe: barcode keeps edge clearance (auto narrow fallback),
+    address wraps at 30 chars (was 32 = full-bleed overflow), QR + ID/COD
+    stack vertically so center/right align never pushes text off-stock,
+    bottom keeps ~3mm clearance above the perforation."""
+    import datetime
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    S = vscale(H)
+    aw = wrap_chars_for(W)
+    cid = tspl_text(p.get("consignment"), 20)
+    cust = tspl_text(p.get("customer"), 30)
+    phone = tspl_text(p.get("phone"), 20)
+    addr_lines = wrap(tspl_text(p.get("address"), aw * 3), aw, max_lines=3)
+    addr_lines = (addr_lines + ["", "", ""])[:3]
+    a1, a2, a3 = addr_lines
+    cod = tspl_text(p.get("cod"), 12) or "0"
+    hub = tspl_text(p.get("branch") or p.get("hub"), 24)
+    today = datetime.date.today().strftime("%d-%b-%y")
+    bx, narrow = barcode_fit(cid, W, align)
+    bw = bar_w(W)
+    rx = bar_x(W, align)
+    qx = qr_x(W, align, cell=3)
+    cod_line = "COD Tk %s" % cod
+    lines = [
+        "SIZE %d mm, %d mm" % (w_mm, h_mm),
+        "GAP 2 mm, 0",
+        "DIRECTION 1",
+        "CLS",
+    ] + ([border_line(W, H)] if border_on(p) else []) + [
+        'TEXT %d,%d,"4",0,1,1,"PATHAO"' % (text_x("PATHAO", "4", W, align), S(12)),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(56), cid),
+        'BARCODE %d,%d,"128",64,1,0,%d,%d,"%s"' % (bx, S(92), narrow, narrow, cid),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cust, "3", W, align), S(172), cust),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(phone, "2", W, align), S(212), phone),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a1, "2", W, align), S(244), a1),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a2, "2", W, align), S(276), a2),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a3, "2", W, align), S(308), a3),
+        "BAR %d,%d,%d,2" % (rx, S(344), bw),
+        'TEXT %d,%d,"4",0,1,1,"COD Tk %s"' % (text_x(cod_line, "4", W, align), S(356), cod),
+        "BAR %d,%d,%d,2" % (rx, S(412), bw),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(hub, "3", W, align), S(424), hub),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(today, "2", W, align), S(468), today),
+        'QRCODE %d,%d,"L",3,"A",0,"%s"' % (qx, S(496), cid),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(cid, "2", W, align), S(590), cid),
+        "PRINT 1,1",
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode("ascii", errors="replace")
+
+
+def build_std_tspl(p):
+    """Standard sticker (default 48x80mm, dynamic SIZE + align).
+    Same margin guarantees as pathao: barcode clearance, 30-char wrap,
+    QR stacked above its caption so center/right never clips."""
+    w_mm, h_mm, W, H, align = stock_dims(p)
+    S = vscale(H)
+    aw = wrap_chars_for(W)
+    cid = tspl_text(p.get("consignment"), 20)
+    cust = tspl_text(p.get("customer"), 30)
+    phone = tspl_text(p.get("phone"), 20)
+    addr = tspl_text(p.get("address"), aw * 3)
+    cod = tspl_text(p.get("cod"), 12)
+    hub = tspl_text(p.get("branch") or p.get("hub"), 24)
+    addr_lines = (wrap(addr, aw, max_lines=3) + ["", "", ""])[:3]
+    a1, a2, a3 = addr_lines
+    bx, narrow = barcode_fit(cid, W, align)
+    bw = bar_w(W)
+    rx = bar_x(W, align)
+    qx = qr_x(W, align, cell=3)
+    lines = [
+        "SIZE %d mm, %d mm" % (w_mm, h_mm),
+        "GAP 2 mm, 0",
+        "DIRECTION 1",
+        "CLS",
+    ] + ([border_line(W, H)] if border_on(p) else []) + [
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(16), cid),
+        'BARCODE %d,%d,"128",64,1,0,%d,%d,"%s"' % (bx, S(56), narrow, narrow, cid),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cust, "3", W, align), S(140), cust),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(phone, "2", W, align), S(188), phone),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a1, "2", W, align), S(220), a1),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a2, "2", W, align), S(252), a2),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a3, "2", W, align), S(284), a3),
+        "BAR %d,%d,%d,2" % (rx, S(324), bw),
+        'TEXT %d,%d,"4",0,1,1,"COD Tk %s"' % (text_x("COD Tk " + cod, "4", W, align), S(336), cod) if cod else 'TEXT %d,%d,"4",0,1,1,""' % (text_x("", "4", W, align), S(336)),
+        "BAR %d,%d,%d,2" % (rx, S(392), bw),
+        'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(hub, "3", W, align), S(404), hub),
+        'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(cid, "2", W, align), S(452), cid),
+        'QRCODE %d,%d,"L",3,"A",0,"%s"' % (qx, S(484), cid),
+        'TEXT %d,%d,"2",0,1,1,"COD Tk %s"' % (text_x("COD Tk " + cod, "2", W, align), S(578), cod) if cod else 'TEXT %d,%d,"2",0,1,1,""' % (text_x("", "2", W, align), S(578)),
+    ]
+    copies = p.get("copies") or 1
+    try:
+        copies = max(1, min(5, int(copies)))
+    except (TypeError, ValueError):
+        copies = 1
+    lines.append("PRINT 1,%d" % copies)
+    return ("\r\n".join(lines) + "\r\n").encode("ascii", errors="replace")
+
+
+def do_print(p):
+    try:
+        import serial
+    except ImportError:
+        return {"ok": False, "error": "pyserial missing on this Mac (pip install pyserial)"}
+    if (p.get("template") or "pathao") in ("pathao", "std", "run") and not tspl_text(p.get("consignment"), 20):
+        return {"ok": False, "error": "empty consignment id"}
+    ox, oy = stock_offset(p)
+    tspl = apply_offset(build_tspl(p), ox, oy)
+    # Printer choice: explicit message/config device wins; otherwise a
+    # discovered CABLE printer beats everything, then the CONNECTED
+    # (preferred) device, then other bluetooth, then the built-in default.
+    if p.get("device"):
+        cands = [(p.get("device"), conn_type(p.get("device")))]
+    elif CONFIG.get("device"):
+        cands = [(CONFIG.get("device"), conn_type(CONFIG.get("device")))]
+    else:
+        disc = discover_printers()  # already cable-first
+        cands = [c for c in disc if c[1] == "cable"]
+        if CONFIG.get("preferred"):
+            cands.append((CONFIG.get("preferred"), conn_type(CONFIG.get("preferred"))))
+        cands += [c for c in disc if c[1] == "bluetooth"]
+        seen, uniq_cands = set(), []
+        for dev, conn in cands:
+            if dev not in seen:
+                seen.add(dev)
+                uniq_cands.append((dev, conn))
+        cands = uniq_cands or [(DEVICE_DEFAULT, conn_type(DEVICE_DEFAULT))]
+    last = None
+    tried = []
+    try:
+        import serial
+    except ImportError:
+        return {"ok": False, "error": "pyserial missing (pip install pyserial)"}
+    for dev, conn in cands:
+        for baud in BAUDS:
+            try:
+                # write_timeout: a sleeping/offline BT printer must fail fast,
+                # never hang the caller forever on a blocked write.
+                s = serial.Serial(dev, baud, timeout=5, write_timeout=5)
+                try:
+                    s.write(tspl)
+                    s.flush()
+                    time.sleep(1.0)
+                finally:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                return {"ok": True, "device": dev, "baud": baud,
+                        "bytes": len(tspl), "conn": conn}
+            except Exception as e:  # noqa: BLE001 - try next candidate
+                last = "%s @%s: %s" % (dev, baud, e)
+        tried.append(dev)
+    return {"ok": False, "error": "no printer worked (tried %s): %s" % (tried, last)}
+
+
+def probe_device(dev):
+    """Open+close at each baud without printing. (True, baud) or (False, err)."""
+    try:
+        import serial
+    except ImportError:
+        return False, "pyserial missing (pip install pyserial)"
+    last = None
+    for baud in BAUDS:
+        try:
+            s = serial.Serial(dev, baud, timeout=3, write_timeout=3)
+            try:
+                s.close()
+            except Exception:
+                pass
+            return True, baud
+        except Exception as e:  # noqa: BLE001
+            last = e
+    return False, "unreachable (%s): %s" % (dev, last)
+
+
+def handle(msg):
+    action = (msg.get("action") or "").strip()
+    if action == "ping":
+        return {"ok": True, "host": "db-print", "version": HOST_VERSION,
+                "device": DEVICE_DEFAULT, "conn": conn_type(DEVICE_DEFAULT),
+                "preferred": CONFIG.get("preferred") or "",
+                "width_mm": CONFIG.get("width_mm", 48),
+                "height_mm": CONFIG.get("height_mm", 80),
+                "align": CONFIG.get("align", "left"),
+                "offset_x_mm": CONFIG.get("offset_x_mm", 0),
+                "offset_y_mm": CONFIG.get("offset_y_mm", 0),
+                "border": bool(CONFIG.get("border", False)),
+                "printers": [{"device": d, "conn": c} for d, c in discover_printers()]}
+    if action == "set_sticker_config":
+        try:
+            w = max(30, min(110, int(float(msg.get("width_mm", 48)))))
+            h = max(20, min(150, int(float(msg.get("height_mm", 80)))))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad width/height"}
+        a = str(msg.get("align", "left") or "left").strip().lower()
+        if a == "centre":
+            a = "center"
+        if a not in ("left", "center", "right"):
+            return {"ok": False, "error": "align must be left/center/right"}
+        try:
+            ox = max(-20, min(20, float(msg.get("offset_x_mm", 0))))
+            oy = max(-20, min(20, float(msg.get("offset_y_mm", 0))))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad offset"}
+        brd = (str(msg.get("border", "false")).strip().lower()
+               in ("1", "true", "on", "yes"))
+        ok, err = save_config({"width_mm": w, "height_mm": h, "align": a,
+                               "offset_x_mm": ox, "offset_y_mm": oy,
+                               "border": brd})
+        if not ok:
+            return {"ok": False, "error": "config save failed: " + err}
+        return {"ok": True, "width_mm": w, "height_mm": h, "align": a,
+                "offset_x_mm": ox, "offset_y_mm": oy, "border": brd}
+    if action == "connect_device":
+        dev = tspl_text(msg.get("device"), 128)
+        if not dev:
+            return {"ok": False, "error": "empty device"}
+        ok, info = probe_device(dev)
+        if not ok:
+            return {"ok": False, "error": info, "device": dev}
+        saved, err = save_config({"preferred": dev})
+        if not saved:
+            return {"ok": False, "error": "config save failed: " + err, "device": dev}
+        return {"ok": True, "device": dev, "conn": conn_type(dev), "baud": info}
+    if action == "print_label":
+        if msg.get("dry_run"):
+            if (msg.get("template") or "") == "calibrate":
+                try:
+                    pages, _ch_mm = render_calibrate_pages()
+                    paths = []
+                    imgs = []
+                    for i, im in enumerate(pages):
+                        path = "/tmp/db-calib-preview-%d.png" % i
+                        im.convert("L").save(path)
+                        paths.append(path)
+                        b64 = pil_to_b64(im)
+                        if b64:
+                            imgs.append(b64)
+                    return {"ok": True, "dry_run": True, "pages": len(paths),
+                            "preview": paths, "images": imgs}
+                except Exception as e:  # noqa: BLE001
+                    return {"ok": False, "error": "render failed: %s" % e}
+            if (msg.get("template") or "") in ("note", "letter"):
+                try:
+                    _w, _h, Wd, Hd, al = stock_dims(msg)
+                    pages = render_note_pages(msg.get("title"), msg.get("body"),
+                                              note_orientation(msg),
+                                              letter=((msg.get("from"), msg.get("to"))
+                                                      if (msg.get("template") or "") == "letter" else None),
+                                              W=Wd, H=Hd, align=al)
+                    paths = []
+                    imgs = []
+                    for i, im in enumerate(pages):
+                        path = "/tmp/db-note-preview-%d.png" % i
+                        im.convert("L").save(path)
+                        paths.append(path)
+                        b64 = pil_to_b64(im)
+                        if b64:
+                            imgs.append(b64)
+                    return {"ok": True, "dry_run": True, "pages": len(paths),
+                            "preview": paths, "images": imgs}
+                except Exception as e:  # noqa: BLE001
+                    return {"ok": False, "error": "render failed: %s" % e}
+            if (msg.get("template") or "") in ("margins", "widthtest"):
+                try:
+                    _w, _h, Wd, Hd, _al = stock_dims(msg)
+                    if (msg.get("template") or "") == "widthtest":
+                        mpages = render_width_test_pages(Wd, _w)
+                        tag = "widthtest"
+                    else:
+                        mpages = render_margin_test_pages(Wd, Hd, _w, _h)
+                        tag = "margins"
+                    paths, imgs = [], []
+                    for i, im in enumerate(mpages):
+                        path = "/tmp/db-%s-preview-%d.png" % (tag, i)
+                        im.convert("L").save(path)
+                        paths.append(path)
+                        b64m = pil_to_b64(im)
+                        if b64m:
+                            imgs.append(b64m)
+                    return {"ok": True, "dry_run": True, "pages": len(paths),
+                            "preview": paths, "images": imgs}
+                except Exception as e:  # noqa: BLE001
+                    return {"ok": False, "error": "render failed: %s" % e}
+            try:
+                parcel_img = render_parcel_preview(msg)
+                b64 = pil_to_b64(parcel_img)
+            except Exception:  # noqa: BLE001 - preview best-effort only
+                b64 = ""
+            ox, oy = stock_offset(msg)
+            tspl = apply_offset(build_tspl(msg), ox, oy)
+            out = {"ok": True, "dry_run": True, "bytes": len(tspl),
+                   "conn": conn_type(msg.get("device") or DEVICE_DEFAULT),
+                   "tspl": tspl.decode("ascii", errors="replace")}
+            if b64:
+                out["images"] = [b64]
+                out["pages"] = 1
+            return out
+        return do_print(msg)
+    return {"ok": False, "error": "unknown action: %s" % action}
+
+
+def main():
+    while True:
+        try:
+            msg = read_msg()
+        except Exception as e:  # noqa: BLE001 - malformed frame
+            write_msg({"ok": False, "error": "bad frame: %s" % e})
+            continue
+        if msg is None:
+            break  # EOF: Chrome closed the port
+        try:
+            write_msg(handle(msg))
+        except Exception as e:  # noqa: BLE001 - never die on one request
+            try:
+                write_msg({"ok": False, "error": str(e)})
+            except Exception:
+                break
+
+
+if __name__ == "__main__":
+    # --selftest: used by the installers to verify the host without Chrome
+    # and without spending a sticker (ping only, no serial touch).
+    if "--selftest" in sys.argv[1:]:
+        print(json.dumps(handle({"action": "ping"})))
+        sys.exit(0)
+    main()
