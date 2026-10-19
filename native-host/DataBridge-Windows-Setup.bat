@@ -11,23 +11,20 @@ set WORK=%TEMP%\DataBridgeSetup
 mkdir "%WORK%" 2>nul
 
 set PYCMD=
-where python >nul 2>nul
-if %errorlevel%==0 set PYCMD=python
-if "%PYCMD%"=="" (
-  where py >nul 2>nul
-  if %errorlevel%==0 set PYCMD=py
-)
-if "%PYCMD%"=="" (
-  if exist "%LOCALAPPDATA%\DataBridge\python\python.exe" (
-    set PYCMD=%LOCALAPPDATA%\DataBridge\python\python.exe
-  ) else (
-    goto bootstrap
-  )
-)
+REM Never trust `where python` alone: Windows 10/11 ships a Microsoft Store
+REM "app alias" stub that pretends python exists. Prove each candidate by
+REM actually running it and checking the output: the stub cannot print "123".
+for /f "delims=" %%v in ('python -c "print(123)" 2^>nul') do if "%%v"=="123" set PYCMD=python
+if defined PYCMD goto py_ready
+for /f "delims=" %%v in ('py -3 -c "print(123)" 2^>nul') do if "%%v"=="123" set PYCMD=py
+if defined PYCMD goto py_ready
+if not exist "%LOCALAPPDATA%\DataBridge\python\python.exe" goto bootstrap
+set PYCMD=%LOCALAPPDATA%\DataBridge\python\python.exe
+:py_ready
 goto fetch
 
 :bootstrap
-echo No python found - downloading portable Python (one-time, ~20MB)...
+echo No working Python found - downloading portable Python (one-time, ~20MB)...
 set PYDIR=%LOCALAPPDATA%\DataBridge\python
 mkdir "%PYDIR%" 2>nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip' -OutFile '%WORK%\py.zip'"

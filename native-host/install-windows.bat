@@ -6,23 +6,20 @@ REM COM port + extension ID are auto-detected. No sticker is printed.
 REM Rare manual overrides: install-windows.bat [COM_PORT] [EXTRA_EXT_ID]
 setlocal
 set PYCMD=
-where python >nul 2>nul
-if %errorlevel%==0 set PYCMD=python
-if "%PYCMD%"=="" (
-  where py >nul 2>nul
-  if %errorlevel%==0 set PYCMD=py
-)
-if "%PYCMD%"=="" (
-  if exist "%LOCALAPPDATA%\DataBridge\python\python.exe" (
-    set PYCMD=%LOCALAPPDATA%\DataBridge\python\python.exe
-  ) else (
-    goto bootstrap
-  )
-)
+REM Never trust `where python` alone: Windows 10/11 ships a Microsoft Store
+REM "app alias" stub that pretends python exists. Prove each candidate by
+REM actually running it and checking the output: the stub cannot print "123".
+for /f "delims=" %%v in ('python -c "print(123)" 2^>nul') do if "%%v"=="123" set PYCMD=python
+if defined PYCMD goto py_ready
+for /f "delims=" %%v in ('py -3 -c "print(123)" 2^>nul') do if "%%v"=="123" set PYCMD=py
+if defined PYCMD goto py_ready
+if not exist "%LOCALAPPDATA%\DataBridge\python\python.exe" goto bootstrap
+set PYCMD=%LOCALAPPDATA%\DataBridge\python\python.exe
+:py_ready
 goto runpy
 
 :bootstrap
-echo No python found - downloading portable Python (one-time, ~20MB)...
+echo No working Python found - downloading portable Python (one-time, ~20MB)...
 set PYDIR=%LOCALAPPDATA%\DataBridge\python
 set PYZIP=%TEMP%\db-python-embed.zip
 mkdir "%PYDIR%" 2>nul
