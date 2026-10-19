@@ -1,0 +1,38 @@
+// db-raster.jxa — PDF -> PNG (per page) at target pixel width, grayscale.
+// Uses macOS CoreGraphics (same engine as Preview/print). Multi-page aware.
+// usage: osascript -l JavaScript db-raster.jxa in.pdf outPrefix targetWidth
+// prints lines "page N: WxH -> /path/outN.png"
+ObjC.import('Cocoa');
+ObjC.import('Quartz');
+
+function run(argv) {
+  if (argv.length < 3) return 'usage: in.pdf outPrefix width';
+  var inPath = argv[0], outPrefix = argv[1], targetW = parseInt(argv[2], 10) || 384;
+  var url = $.NSURL.fileURLWithPath(inPath);
+  var doc = $.CGPDFDocumentCreateWithURL(url);
+  if (!doc) throw new Error('cannot open pdf: ' + inPath);
+  var n = $.CGPDFDocumentGetNumberOfPages(doc);
+  var out = [];
+  for (var p = 1; p <= n; p++) {
+    var page = $.CGPDFDocumentGetPage(doc, p);
+    var box = $.CGPDFPageGetBoxRect(page, 0); // kCGPDFMediaBox
+    var pw0 = box.size.width, ph0 = box.size.height;
+    if (!pw0 || !ph0) { out.push('page ' + p + ': empty box, skipped'); continue; }
+    var scale = targetW / pw0;
+    var w = Math.round(pw0 * scale), h = Math.round(ph0 * scale);
+    var cs = $.CGColorSpaceCreateDeviceGray();
+    var ctx = $.CGBitmapContextCreate($(), w, h, 8, 0, cs, 0); // gray, no alpha
+    if (!ctx) throw new Error('bitmap ctx failed page ' + p);
+    $.CGContextSetGrayFillColor(ctx, 1, 1);
+    $.CGContextFillRect(ctx, $.CGRectMake(0, 0, w, h));
+    $.CGContextScaleCTM(ctx, scale, scale);
+    $.CGContextDrawPDFPage(ctx, page);
+    var img = $.CGBitmapContextCreateImage(ctx);
+    var rep = $.NSBitmapImageRep.alloc.initWithCGImage(img);
+    var png = rep.representationUsingTypeProperties(4, $()); // NSPNGFileType
+    var outPath = outPrefix + p + '.png';
+    png.writeToFileAtomically($(outPath), true);
+    out.push('page ' + p + ': ' + w + 'x' + h + ' -> ' + outPath);
+  }
+  return out.join('\n');
+}
