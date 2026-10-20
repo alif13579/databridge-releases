@@ -2,7 +2,7 @@
 """DataBridge print-host installer (Windows) — zero-touch, double-click OK.
 
 No sticker is printed during install. Everything is auto-detected:
-  1. pip deps (pyserial + pillow) install via the running interpreter
+  1. pip deps (pyserial + pillow + qrcode + python-barcode) install via the running interpreter
   2. TL5X COM port scan (FALLS BACK to runtime discovery — no prompt)
   3. Extension ID read from Chrome/Edge Preferences (matched by folder path,
      so unpacked extensions just work — no ID to copy)
@@ -47,13 +47,13 @@ def ext_root():
 
 
 def ensure_deps():
-    say("[1/5] python deps (pyserial + pillow)...")
+    say("[1/5] python deps (pyserial + pillow + qrcode + python-barcode)...")
     # Embedded/portable Pythons have no user site — retry without --user.
     for args in (["--user", "--quiet"], ["--quiet"]):
         try:
             r = subprocess.run(
                 [sys.executable, "-m", "pip", "install"] + args +
-                ["pyserial", "pillow"],
+                ["pyserial", "pillow", "qrcode", "python-barcode"],
                 capture_output=True, text=True, timeout=300)
         except Exception as e:
             return False, "pip launch failed: %s" % e

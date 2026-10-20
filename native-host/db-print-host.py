@@ -12,9 +12,15 @@ Requests:
     dry_run=true builds the TSPL bytes but never touches the serial port
     (safe to verify layout without spending a sticker).
 
-Only print_label opens the serial port. Everything else is side-effect free.
-Label: 48x80mm TSPL, Code128 barcode + ID/customer/phone/address/COD + QR.
-Built-in printer fonts are Latin-only — non-Latin text prints as '?'.
+The site's own central-print → Sticker Print (SPRT) path POSTs its default
+3x4in label HTML to http://localhost:55555/api/print; this host serves that
+local agent, renders the HTML with Chrome and prints the bitmap. That is the
+path used on /central-print (no custom template).
+
+print_label and the local HTTP service open the serial port. Everything else
+is side-effect free.
+Label: site default 75x102mm (600x816 dots) for the local agent; the built-in
+print_label template remains 48x80mm TSPL.
 """
 import sys
 import os
@@ -23,6 +29,13 @@ import struct
 import time
 import subprocess
 import socket
+import threading
+import io
+import base64
+import tempfile
+import shutil
+import http.server
+import urllib.parse
 
 
 def load_config():
@@ -440,7 +453,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 2
+HOST_VERSION = 3
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -451,6 +464,7 @@ HOST_VERSION = 2
 # a sleeping printer gets a fresh connection (a reconnect is what wakes it).
 WARM_MAX_IDLE = 600.0
 _WARM = {"dev": None, "baud": None, "ser": None, "ts": 0.0}
+PRINT_LOCK = threading.Lock()
 
 
 def warm_close():
@@ -1430,15 +1444,20 @@ def build_std_tspl(p):
     return ("\r\n".join(lines) + "\r\n").encode("ascii", errors="replace")
 
 
-def do_print(p):
+def _do_print(p):
     try:
         import serial
     except ImportError:
         return {"ok": False, "error": "pyserial missing on this Mac (pip install pyserial)"}
-    if (p.get("template") or "pathao") in ("pathao", "std", "run") and not tspl_text(p.get("consignment"), 20):
-        return {"ok": False, "error": "empty consignment id"}
-    ox, oy = stock_offset(p)
-    tspl = apply_offset(build_tspl(p), ox, oy)
+    if p.get("_tspl") is not None:
+        tspl = bytes(p.get("_tspl") or b"")
+        if not tspl:
+            return {"ok": False, "error": "empty tspl"}
+    else:
+        if (p.get("template") or "pathao") in ("pathao", "std", "run") and not tspl_text(p.get("consignment"), 20):
+            return {"ok": False, "error": "empty consignment id"}
+        ox, oy = stock_offset(p)
+        tspl = apply_offset(build_tspl(p), ox, oy)
     # Connection choice — `prefer` (payload or config, default "auto"):
     #   auto  -> the CONNECTED (preferred) device first, then Bluetooth,
     #            then cable. Bluetooth-first: the extension acts as the
@@ -1523,6 +1542,12 @@ def do_print(p):
                 last = "%s @%s: %s" % (dev, baud, e)
         tried.append(dev)
     return {"ok": False, "error": "no printer worked (tried %s): %s" % (tried, last)}
+
+
+def do_print(p):
+    """Serialize native and local-service prints on the single hot port."""
+    with PRINT_LOCK:
+        return _do_print(p)
 
 
 def probe_device(dev):
@@ -1696,10 +1721,309 @@ def handle(msg):
                 out["pages"] = 1
             return out
         return do_print(msg)
+    if action == "print_html":
+        payload = msg.get("payload")
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "missing payload"}
+        return print_html_label(payload)
     return {"ok": False, "error": "unknown action: %s" % action}
 
 
+# ── Local print service: the site's own SPRT path ───────────────────────
+# Hermes' central-print "SPRT" option does not send ZPL/TSPL. It builds the
+# default 3x4in label as HTML and POSTs it to a local agent on port 55555
+# (55556 on macOS). With the extension in the loop, this host *is* that
+# agent: it renders the site's HTML with the installed Chrome (headless),
+# converts the screenshot to a 1-bit bitmap and sends it to the TL5X over
+# Bluetooth. No custom sticker template, no click interception — the site's
+# own print/status flow runs exactly as it does on a cable setup.
+LABEL_SERVICE_PORT = 55556 if sys.platform == "darwin" else 55555
+LABEL_WIDTH_MM = 75
+LABEL_HEIGHT_MM = 102
+LABEL_W_DOTS = 600
+LABEL_H_DOTS = 816
+_HTTP_STARTED = False
+
+# Minimal Tailwind subset used by the site's label templates. Kept local so
+# the service works offline and cannot be broken by a Hermes asset deploy.
+LABEL_CSS = r"""
+html,body{margin:0;padding:0;background:#fff;}
+*{box-sizing:border-box;}
+body{font-family:Arial,Helvetica,sans-serif;color:#000;}
+.flex{display:flex}.justify-between{justify-content:space-between}.justify-center{justify-content:center}.items-center{align-items:center}.flex-1{flex:1 1 0%}
+.text-center{text-align:center}.font-semibold{font-weight:600}.font-medium{font-weight:500}.font-normal{font-weight:400}
+.text-xs{font-size:12px}.text-sm{font-size:14px}.text-base{font-size:16px}.text-lg{font-size:18px}.text-xl{font-size:20px}.text-2xl{font-size:24px}
+.leading-none{line-height:1}.leading-tight{line-height:1.25}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-full{width:100%}.w-1\/2{width:50%}.w-1\/3{width:33.333333%}.w-2\/3{width:66.666667%}.w-1\/5{width:20%}.w-2\/5{width:40%}.w-3\/5{width:60%}.w-4\/5{width:80%}
+.border{border:1px solid #000}.border-black{border-color:#000}.border-b{border-bottom:1px solid #000}.border-l{border-left:1px solid #000}
+.bg-white{background:#fff}.bg-black{background:#000}.text-white{color:#fff}
+.py-1{padding-top:4px;padding-bottom:4px}.py-2{padding-top:8px;padding-bottom:8px}
+.px-1{padding-left:4px;padding-right:4px}.px-2{padding-left:8px;padding-right:8px}
+.pl-1{padding-left:4px}.pb-1{padding-bottom:4px}.mb-1{margin-bottom:4px}.mb-2{margin-bottom:8px}
+.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-4{margin-top:16px}.mt-5{margin-top:20px}
+.mr-1{margin-right:4px}.my-1{margin-top:4px;margin-bottom:4px}
+.overflow-hidden{overflow:hidden}.h-11{height:44px}.h-16{height:64px}.min-w-0{min-width:0}
+table{border-collapse:collapse}th,td{padding:0}.table-fixed{table-layout:fixed}.border-collapse{border-collapse:collapse}
+.self-center{align-self:center}
+@page{size:75mm 102mm;margin:0}
+"""
+
+
+def _barcode_data_url(text):
+    """Code128 PNG as a data URI (the site's local agent replaces the
+    __barcode__ placeholder with the real barcode)."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    try:
+        import barcode as _barcode
+        from barcode.writer import ImageWriter
+        obj = _barcode.get("code128", text, writer=ImageWriter())
+        img = obj.render(writer_options={
+            "write_text": False,
+            "module_height": 8.0,
+            "module_width": 0.25,
+            "quiet_zone": 1.0,
+            "dpi": 300,
+        })
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
+def _qr_data_url(text):
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(box_size=8, border=2,
+                           error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr.add_data(text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").get_image().convert("L")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
+def _build_label_html(payload):
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("empty label content")
+    bc = payload.get("barcodeProperties") or {}
+    qr = payload.get("qrProperties") or {}
+    bc_text = str(bc.get("content") or "").strip() if isinstance(bc, dict) else ""
+    qr_text = str(qr.get("content") or "").strip() if isinstance(qr, dict) else ""
+    try:
+        qr_w = max(32, min(200, int(qr.get("width") or 72)))
+        qr_h = max(32, min(200, int(qr.get("height") or 72)))
+    except (TypeError, ValueError):
+        qr_w = qr_h = 72
+    bc_url = _barcode_data_url(bc_text)
+    qr_url = _qr_data_url(qr_text)
+    if bc_url:
+        content = content.replace(
+            "__barcode__",
+            '<img src="' + bc_url + '" style="height:36px;max-width:100%;display:block;">')
+    if qr_url:
+        content = content.replace(
+            "__qr_code__",
+            '<img src="' + qr_url + '" style="width:%dpx;height:%dpx;display:block;">' % (qr_w, qr_h))
+    return ('<!doctype html><html><head><meta charset="utf-8">'
+            '<style>' + LABEL_CSS + '</style></head>' + content + '</html>')
+
+
+def _find_chrome():
+    cands = [
+        os.path.join(os.environ.get("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    for name in ("chrome", "google-chrome", "chromium", "msedge"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return ""
+
+
+def _render_label_tspl(payload):
+    """Render the site's HTML at 203dpi and return raw TSPL bitmap bytes."""
+    chrome = _find_chrome()
+    if not chrome:
+        raise RuntimeError("Chrome/Edge not found for label rendering")
+    html = _build_label_html(payload)
+    tmpdir = tempfile.mkdtemp(prefix="db-label-")
+    html_path = os.path.join(tmpdir, "label.html")
+    png_path = os.path.join(tmpdir, "label.png")
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        url = "file:///" + urllib.parse.quote(
+            os.path.abspath(html_path).replace("\\", "/"), safe="/:")
+        args = [
+            chrome,
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--user-data-dir=" + os.path.join(tmpdir, "profile"),
+            "--screenshot=" + png_path,
+            "--window-size=283,384",
+            "--force-device-scale-factor=2.115",
+            "--virtual-time-budget=2000",
+            url,
+        ]
+        proc = subprocess.run(args, capture_output=True, timeout=45)
+        if not os.path.isfile(png_path) or os.path.getsize(png_path) < 100:
+            err = (proc.stderr or b"").decode("utf-8", "replace")[-400:]
+            raise RuntimeError("screenshot failed: " + (err or "no output"))
+        from PIL import Image
+        img = Image.open(png_path).convert("L")
+        img = img.resize((LABEL_W_DOTS, LABEL_H_DOTS), Image.LANCZOS)
+        img = img.point(lambda v: 0 if v < 160 else 255)
+        out = [
+            ("SIZE %d mm, %d mm" % (LABEL_WIDTH_MM, LABEL_HEIGHT_MM)).encode(),
+            b"GAP 2 mm, 0",
+            b"DIRECTION 1",
+            b"CLS",
+            pyt(img, LABEL_WIDTH_MM, LABEL_HEIGHT_MM),
+            b"PRINT 1,1",
+        ]
+        return b"\r\n".join(out) + b"\r\n"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def print_html_label(payload):
+    try:
+        tspl = _render_label_tspl(payload)
+    except Exception as e:  # noqa: BLE001 - report to the site
+        return {"ok": False, "error": "label render failed: %s" % e}
+    req = {"_tspl": tspl}
+    dev = CONFIG.get("device") or CONFIG.get("preferred") or ""
+    if dev:
+        req["device"] = dev
+    return do_print(req)
+
+
+class _LabelHTTPHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "DataBridgePrint/1.0"
+
+    def log_message(self, fmt, *args):
+        pass  # stdout is the native-messaging channel
+
+    def _cors(self):
+        origin = self.headers.get("Origin") or ""
+        if origin == "https://hermes.pathaointernal.com":
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        req_headers = self.headers.get("Access-Control-Request-Headers")
+        self.send_header("Access-Control-Allow-Headers",
+                         req_headers or "Content-Type, Authorization, X-Requested-With, "
+                                        "X-CSRF-TOKEN, X-XSRF-TOKEN, Accept")
+        self.send_header("Access-Control-Max-Age", "86400")
+        if self.headers.get("Access-Control-Request-Private-Network") == "true":
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/ping", "/health"):
+            self._json(200, {"ok": True, "host": "db-print", "version": HOST_VERSION})
+        else:
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path not in ("/api/print", "/print"):
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > 2_000_000:
+                self._json(400, {"ok": False, "error": "bad content length"})
+                return
+            payload = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+            res = print_html_label(payload)
+            self._json(200 if res.get("ok") else 500, res)
+        except Exception as e:  # noqa: BLE001
+            self._json(500, {"ok": False, "error": str(e)})
+
+
+def _start_label_service():
+    global _HTTP_STARTED
+    if _HTTP_STARTED:
+        return
+    _HTTP_STARTED = True
+    servers = []
+    try:
+        class _Server(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+        servers.append(_Server(("127.0.0.1", LABEL_SERVICE_PORT), _LabelHTTPHandler))
+    except Exception as e:  # noqa: BLE001 - try IPv6 loopback below
+        sys.stderr.write("db-print: IPv4 print service unavailable on %s: %s\n"
+                         % (LABEL_SERVICE_PORT, e))
+    try:
+        class _Server6(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+            daemon_threads = True
+            allow_reuse_address = True
+        servers.append(_Server6(("::1", LABEL_SERVICE_PORT), _LabelHTTPHandler))
+    except Exception:
+        pass  # IPv6 disabled or already covered by ::1
+    if not servers:
+        sys.stderr.write("db-print: local print service unavailable on port %s\n"
+                         % LABEL_SERVICE_PORT)
+        return
+    for i, srv in enumerate(servers):
+        t = threading.Thread(target=srv.serve_forever,
+                             name="db-print-http-%d" % i, daemon=True)
+        t.start()
+
+
 def main():
+    _start_label_service()
     while True:
         try:
             msg = read_msg()
