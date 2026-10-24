@@ -200,31 +200,88 @@ def text_x(text, font, W, align, margin=12):
     return margin
 
 
-def barcode_fit(cid, W, align, margin=3):
-    """(x, narrow) for a Code128 barcode with safe edge clearance.
+CODE93_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%")
 
-    Margin bug fixed: a 14-char ID at narrow=2 is ~378 dots — on a 384-dot
-    stock starting at x=6 it ended exactly at dot 384 (zero right margin,
-    any printer tolerance clipped it). Now x shifts left to keep `margin`
-    dots of clearance (14-char → x=3, ends at 381), and only long IDs fall
-    back to narrow=1. narrow=2 stays preferred — this TL5X prints narrow=1
-    faintly, so we keep 2 whenever it fits.
+
+def code128_modules(n):
+    """Total Code128 modules (worst case subset B): start(11) + data(11/char) + check(11) + stop(13)."""
+    return 11 * int(n) + 35
+
+
+def code128_modules_min(cid):
+    """Best-case Code128 module count, using subset C for digit runs so
+    numeric IDs get the widest possible bars."""
+    s = str(cid or "")
+    if not s.isdigit():
+        return code128_modules(len(s))
+    n = len(s)
+    # subset C: one symbol per digit pair; odd length needs one subset-B char + switch
+    pairs = n // 2
+    odd = n % 2
+    return 11 * (pairs + (1 if odd else 0) + (1 if odd else 0)) + 35
+
+
+def code93_modules(n):
+    """Total Code93 modules: start/stop(9+9) + data(9/char) + checks(9+9) + term(1)."""
+    return 9 * int(n) + 37
+
+
+def barcode_wide(sym, narrow):
+    """TSPL's BARCODE table only supports Code93 at a narrow:wide ratio of 1:3."""
+    return int(narrow) * 3 if sym == "93" else int(narrow)
+
+
+def barcode_plan(cid, W, align, inset=0, quiet_modules=10):
+    """(symbology, x, narrow) for a barcode that a scanner can actually read.
+
+    A 14-char Pathao ID is 189 Code128 modules = 378 dots at narrow=2 on a
+    384-dot (48 mm) stock: edge to edge, with no quiet zone at all, so the
+    start/stop patterns sit inside the label tolerance and scans fail.
+    Code93 carries the same text in 163 modules (326 dots) and leaves
+    ~3.6 mm of white on each side. Prefer Code128 whenever it fits with a
+    full 10-module quiet zone; fall back to Code93 (same text, Zebra/TSPL
+    scanners decode it) when Code128 is too wide. Never clip at the edge.
     """
     cid = str(cid or "")
-    for narrow in (2, 1):
-        bw = (11 * len(cid) + 35) * narrow
-        room = W - margin * 2 - bw
-        if room < 0:
-            continue  # doesn't fit even edge-to-edge minus margins
+    n = len(cid)
+
+    def place(modules, narrow, qm=None):
+        bw = modules * narrow
+        qz = max(int(inset or 0), (qm if qm is not None else quiet_modules) * narrow)
+        if bw + 2 * qz > W:
+            return None
         if align == "center":
-            return max(margin, (W - bw) // 2), narrow
-        if align == "right":
-            return max(margin, W - margin - bw), narrow
-        # left: keep historic x≈6..12 but never cross the right margin
-        return max(margin, min(12, W - margin - bw)), narrow
-    # Pathological ID (still too long at narrow=1): pin left, let it clip
-    # rather than go negative — caller truncates the human-readable text.
-    return margin, 1
+            x = (W - bw) // 2
+        elif align == "right":
+            x = W - qz - bw
+        else:
+            x = qz
+        return max(0, int(x)), int(narrow)
+
+    if n:
+        c128_mods = code128_modules_min(cid)
+        for qm in (quiet_modules, max(4, quiet_modules // 2)):
+            for narrow in (4, 3, 2):
+                p = place(c128_mods, narrow, qm)
+                if p:
+                    return "128", p[0], p[1]
+        if all(c in CODE93_CHARS for c in cid):
+            for qm in (quiet_modules, max(4, quiet_modules // 2)):
+                for narrow in (4, 3, 2):
+                    p = place(code93_modules(n), narrow, qm)
+                    if p:
+                        return "93", p[0], p[1]
+        # Last resort: Code128 at 1 dot, reduced quiet zone.
+        p = place(c128_mods, 1, max(4, quiet_modules // 2))
+        if p:
+            return "128", p[0], p[1]
+    return "128", int(inset or 0), 2
+
+
+def barcode_fit(cid, W, align, margin=3):
+    """Back-compat (tests / old callers): (x, narrow) from barcode_plan()."""
+    _sym, x, narrow = barcode_plan(cid, W, align)
+    return x, narrow
 
 
 def barcode_x(cid, W, align, narrow=2, margin=6):
@@ -305,6 +362,95 @@ def discover_printers():
         pass
     found.sort(key=lambda x: 0 if x[1] == "cable" else 1)
     return found
+
+
+# ── Real connection status ───────────────────────────────────────────────
+# macOS keeps /dev/cu.TL5XBTPrinter around while the printer is paired even
+# when it is powered off — so "a device node exists" is NOT "connected".
+# That false positive made the popup show 🟢 Connected with the printer off.
+# Bluetooth link state comes from system_profiler (device_connected vs
+# device_not_connected); cable/Windows ports are checked by opening them.
+_BT_CACHE = {"at": 0.0, "connected": [], "paired": []}
+
+
+def _norm_name(s):
+    return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+
+def bt_link_lists():
+    """(connected, paired) Bluetooth device names on macOS, cached 5s.
+    Returns (None, None) when the platform/profiler can't answer."""
+    if sys.platform != "darwin":
+        return None, None
+    if _BT_CACHE["at"] and time.time() - _BT_CACHE["at"] < 5:
+        return _BT_CACHE["connected"], _BT_CACHE["paired"]
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/system_profiler", "SPBluetoothDataType", "-json"],
+            capture_output=True, text=True, timeout=8).stdout
+        data = json.loads(out)
+    except Exception:
+        return None, None
+    connected, paired = [], []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key in ("device_connected", "device_not_connected") and isinstance(val, list):
+                    target = connected if key == "device_connected" else paired
+                    for item in val:
+                        if isinstance(item, dict):
+                            target.extend(str(n) for n in item.keys())
+                else:
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    _BT_CACHE.update(at=time.time(), connected=connected, paired=paired)
+    return connected, paired
+
+
+def bt_name_connected(dev, names):
+    base = os.path.basename(str(dev or ""))
+    if base.startswith("cu."):
+        base = base[3:]
+    want = _norm_name(base)
+    if not want:
+        return False
+    for name in names or []:
+        n = _norm_name(name)
+        if n == want:
+            return True
+        if len(n) >= 5 and (n in want or want in n):
+            return True
+    return False
+
+
+def device_connected(dev):
+    """(connected, reason) — real reachability, not just a /dev node.
+    reason: warm | bluetooth | cable | paired-not-connected | not-found |
+            unreachable | node | unknown."""
+    dev = dev or DEVICE_DEFAULT
+    if _WARM.get("ser") is not None and _WARM.get("dev") == dev:
+        return True, "warm"
+    ctype = conn_type(dev)
+    if ctype == "bluetooth" and sys.platform == "darwin":
+        live, paired = bt_link_lists()
+        if live is None:
+            return True, "unknown"  # can't verify — never claim offline
+        if bt_name_connected(dev, live):
+            return True, "bluetooth"
+        if bt_name_connected(dev, paired):
+            return False, "paired-not-connected"
+        return False, "not-found"
+    if ctype == "cable":
+        return (True, "cable") if os.path.exists(dev) else (False, "not-found")
+    if os.name == "nt":
+        ok, info = probe_device(dev)
+        return (True, str(info)) if ok else (False, "unreachable")
+    return os.path.exists(dev), "node"
 
 
 # ── macOS CUPS driver health / test / restart ────────────────────────────
@@ -415,11 +561,13 @@ def driver_status():
     except Exception:
         pass
     bt_dev = [d for d, c in discover_printers() if c == "bluetooth"]
+    bt_linked = [d for d in bt_dev if device_connected(d)[0]]
     return {
         "ok": True, "supported": True, "platform": "darwin",
         "daemon": daemon, "queue": queue,
         "port": {"listening": listening, "port": DAEMON_PORT},
         "bt_devices": bt_dev,
+        "bt_linked": bt_linked,
         "daemon_log": _tail(DAEMON_LOG),
     }
 
@@ -453,7 +601,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 3
+HOST_VERSION = 5
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -745,14 +893,14 @@ def build_bitmap_sticker(p):
         place(560, cid, 13)
     hline(344)
     hline(412)
-    narrow = max(2, barcode_fit(cid, W - 2 * ins, align)[1] or 2)
+    bc_type, bar_x, narrow = barcode_plan(cid, W, align, inset=ins)
     bar_y = S(96)
-    bar_x = (W - min(W - 2 * ins, len(cid) * 13 * narrow)) // 2
     out = [("SIZE %d mm, %d mm" % (w_mm, h_mm)).encode(),
            b"GAP 2 mm, 0", b"DIRECTION 1", b"CLS",
            pyt(canvas, w_mm, h_mm),
-           ('BARCODE %d,%d,"128",%d,1,0,%d,%d,"%s"'
-            % (bar_x, bar_y, int(64 * k), narrow, narrow, cid)).encode(),
+           ('BARCODE %d,%d,"%s",%d,1,0,%d,%d,"%s"'
+            % (bar_x, bar_y, bc_type, int(96 * k), narrow,
+               barcode_wide(bc_type, narrow), cid)).encode(),
            b"PRINT 1,1"]
     return b"\r\n".join(out) + b"\r\n"
 
@@ -1168,12 +1316,14 @@ def render_parcel_preview(p):
             pass
 
     def bars(yb, label, h=64):
-        # fake barcode: alternating bars (same height as the TSPL barcode)
+        # fake barcode: alternating bars drawn at the SAME x/width/narrow the
+        # firmware barcode will use, so the preview shows the real white gap.
         y = S(yb)
-        bw = min(W - 16, max(120, len(label) * 12))
-        x0 = 8 if align == "left" else (W - 8 - bw if align == "right" else (W - bw) // 2)
+        sym, x0, narrow = barcode_plan(label, W, align)
+        mods = code93_modules(len(label)) if sym == "93" else code128_modules(len(label))
+        bw = min(W, mods * narrow)
         for i in range(0, bw, 4):
-            dr.rectangle([x0 + i, y, x0 + i + 2, y + h], fill=0)
+            dr.rectangle([min(x0 + i, W - 1), y, min(x0 + i + 2, W - 1), y + h], fill=0)
         return yb
 
     def rule(yb):
@@ -1321,7 +1471,7 @@ def build_run_tspl(p):
     run = tspl_text(p.get("run"), 30)
     hub = tspl_text(p.get("hub"), 30)
     date = tspl_text(p.get("date"), 20) or datetime.date.today().strftime("%d-%b-%y")
-    bx, narrow = barcode_fit(cid, W, align)
+    bc_type, bx, narrow = barcode_plan(cid, W, align)
     bw = bar_w(W)
     rx = bar_x(W, align)
     lines = [
@@ -1330,7 +1480,7 @@ def build_run_tspl(p):
         "DIRECTION 1",
         "CLS",
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(16), cid),
-        'BARCODE %d,%d,"128",72,1,0,%d,%d,"%s"' % (bx, S(56), narrow, narrow, cid),
+        'BARCODE %d,%d,"%s",96,1,0,%d,%d,"%s"' % (bx, S(56), bc_type, narrow, barcode_wide(bc_type, narrow), cid),
         'TEXT %d,%d,"4",0,1,1,"%s"' % (text_x(status, "4", W, align), S(148), status),
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(run, "3", W, align), S(212), run),
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(hub, "3", W, align), S(264), hub),
@@ -1364,7 +1514,7 @@ def build_pathao_tspl(p):
     cod = tspl_text(p.get("cod"), 12) or "0"
     hub = tspl_text(p.get("branch") or p.get("hub"), 24)
     today = datetime.date.today().strftime("%d-%b-%y")
-    bx, narrow = barcode_fit(cid, W, align)
+    bc_type, bx, narrow = barcode_plan(cid, W, align)
     bw = bar_w(W)
     rx = bar_x(W, align)
     qx = qr_x(W, align, cell=3)
@@ -1377,7 +1527,7 @@ def build_pathao_tspl(p):
     ] + ([border_line(W, H)] if border_on(p) else []) + [
         'TEXT %d,%d,"4",0,1,1,"PATHAO"' % (text_x("PATHAO", "4", W, align), S(12)),
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(56), cid),
-        'BARCODE %d,%d,"128",64,1,0,%d,%d,"%s"' % (bx, S(92), narrow, narrow, cid),
+        'BARCODE %d,%d,"%s",96,1,0,%d,%d,"%s"' % (bx, S(92), bc_type, narrow, barcode_wide(bc_type, narrow), cid),
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cust, "3", W, align), S(172), cust),
         'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(phone, "2", W, align), S(212), phone),
         'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a1, "2", W, align), S(244), a1),
@@ -1410,7 +1560,7 @@ def build_std_tspl(p):
     hub = tspl_text(p.get("branch") or p.get("hub"), 24)
     addr_lines = (wrap(addr, aw, max_lines=3) + ["", "", ""])[:3]
     a1, a2, a3 = addr_lines
-    bx, narrow = barcode_fit(cid, W, align)
+    bc_type, bx, narrow = barcode_plan(cid, W, align)
     bw = bar_w(W)
     rx = bar_x(W, align)
     qx = qr_x(W, align, cell=3)
@@ -1421,7 +1571,7 @@ def build_std_tspl(p):
         "CLS",
     ] + ([border_line(W, H)] if border_on(p) else []) + [
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cid, "3", W, align), S(16), cid),
-        'BARCODE %d,%d,"128",64,1,0,%d,%d,"%s"' % (bx, S(56), narrow, narrow, cid),
+        'BARCODE %d,%d,"%s",96,1,0,%d,%d,"%s"' % (bx, S(56), bc_type, narrow, barcode_wide(bc_type, narrow), cid),
         'TEXT %d,%d,"3",0,1,1,"%s"' % (text_x(cust, "3", W, align), S(140), cust),
         'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(phone, "2", W, align), S(188), phone),
         'TEXT %d,%d,"2",0,1,1,"%s"' % (text_x(a1, "2", W, align), S(220), a1),
@@ -1573,18 +1723,21 @@ def probe_device(dev):
 def handle(msg):
     action = (msg.get("action") or "").strip()
     if action == "ping":
+        dev_ok, dev_why = device_connected(DEVICE_DEFAULT)
         return {"ok": True, "host": "db-print", "version": HOST_VERSION,
                 "device": DEVICE_DEFAULT, "conn": conn_type(DEVICE_DEFAULT),
                 "preferred": CONFIG.get("preferred") or "",
                 "prefer": CONFIG.get("prefer", "auto"),
                 "warm": bool(_WARM.get("ser")),
+                "connected": dev_ok, "connected_reason": dev_why,
                 "width_mm": CONFIG.get("width_mm", 48),
                 "height_mm": CONFIG.get("height_mm", 80),
                 "align": CONFIG.get("align", "left"),
                 "offset_x_mm": CONFIG.get("offset_x_mm", 0),
                 "offset_y_mm": CONFIG.get("offset_y_mm", 0),
                 "border": bool(CONFIG.get("border", False)),
-                "printers": [{"device": d, "conn": c} for d, c in discover_printers()]}
+                "printers": [{"device": d, "conn": c, "connected": device_connected(d)[0]}
+                              for d, c in discover_printers()]}
     if action == "driver_status":
         return driver_status()
     if action == "driver_test":
@@ -1781,9 +1934,9 @@ def _barcode_data_url(text):
         obj = _barcode.get("code128", text, writer=ImageWriter())
         img = obj.render(writer_options={
             "write_text": False,
-            "module_height": 8.0,
-            "module_width": 0.25,
-            "quiet_zone": 1.0,
+            "module_height": 12.0,
+            "module_width": 0.4,
+            "quiet_zone": 2.0,
             "dpi": 300,
         })
         buf = io.BytesIO()
