@@ -338,15 +338,18 @@ def discover_printers():
     Unknown devices are skipped (never poke random hardware)."""
     found = []
     try:
-        if os.name == "nt":
-            from serial.tools import list_ports
-            for p in list_ports.comports():
-                desc = ((p.description or "") + " " + (p.device or "")).lower()
-                if "usb" in desc:
-                    found.append((p.device, "cable"))
-                elif "bluetooth" in desc:
-                    found.append((p.device, "bluetooth"))
-        else:
+         if os.name == "nt":
+             from serial.tools import list_ports
+             for p in list_ports.comports():
+                 desc = ((p.description or "") + " " + (p.device or "")).lower()
+                 if "bluetooth" in desc or "bt" in desc or "rfcomm" in desc:
+                     found.append((p.device, "bluetooth"))
+                 else:
+                     # Treat every non-Bluetooth serial port as a cable candidate
+                     # (TL5X over USB often shows up as a plain COM port whose
+                     # description lacks "usb", e.g. "Serial Port (COM5)").
+                     found.append((p.device, "cable"))
+         else:
             import glob
             cands = sorted(glob.glob("/dev/cu.*") + glob.glob("/dev/ttyUSB*") +
                            glob.glob("/dev/ttyACM*") + glob.glob("/dev/rfcomm*"))
