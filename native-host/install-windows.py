@@ -47,7 +47,7 @@ def ext_root():
 
 
 def ensure_deps():
-    say("[1/5] python deps (pyserial + pillow + qrcode + python-barcode)...")
+    say("[1/7] python deps (pyserial + pillow + qrcode + python-barcode)...")
     # Embedded/portable Pythons have no user site — retry without --user.
     for args in (["--user", "--quiet"], ["--quiet"]):
         try:
@@ -68,7 +68,7 @@ def detect_com(override=""):
     """Returns (port or '', how). Only pins a fixed port when confident
     (TL5X-named or a single bluetooth candidate) — otherwise the host scans
     all ports at print time, so guessing wrong is worse than not guessing."""
-    say("[2/5] printer COM port scan...")
+    say("[2/7] printer COM port scan...")
     if override:
         say("      override: %s" % override)
         return override, "manual override"
@@ -134,7 +134,7 @@ def ids_from_prefs(prefs_path, root):
 
 
 def detect_ids(extra=""):
-    say("[3/5] extension ID detect...")
+    say("[3/7] extension ID detect...")
     root = ext_root()
     local = os.environ.get("LOCALAPPDATA", "")
     cands = [
@@ -163,7 +163,7 @@ def detect_ids(extra=""):
 
 
 def install_files(com_port):
-    say("[4/5] installing host files...")
+    say("[4/7] installing host files...")
     def host_source():
         here = os.path.dirname(os.path.abspath(__file__))
         local = os.path.join(here, "db-print-host.py")
@@ -207,7 +207,7 @@ def install_files(com_port):
 
 
 def register(ids):
-    say("[5/5] registering with Chrome + Edge...")
+    say("[5/7] registering with Chrome + Edge...")
     manifest = os.path.join(TARGET, HOST_NAME + ".json")
     origins = ["chrome-extension://%s/" % i for i in ids]
     try:
@@ -253,6 +253,116 @@ def selftest():
     return True, ""
 
 
+def host_exe():
+    """Interpreter for the background print service — windowless if possible."""
+    d = os.path.dirname(sys.executable)
+    for name in ("pythonw.exe", os.path.basename(sys.executable)):
+        cand = os.path.join(d, name)
+        if cand and os.path.isfile(cand):
+            return cand
+    return sys.executable
+
+
+def install_autostart():
+    """Run `db-print-host.py --serve` at login so other laptops can print
+    through this one even when Chrome/Edge is closed."""
+    say("[6/7] LAN print autostart...")
+    host = os.path.join(TARGET, "db-print-host.py")
+    exe = host_exe()
+    value = "DataBridgePrintHost"
+    run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        if exe.lower().endswith("pythonw.exe"):
+            cmd = '"%s" "%s" --serve' % (exe, host)
+        else:
+            # Console Python: hidden VBS wrapper so no window flashes at login.
+            vbs = os.path.join(TARGET, "db-print-serve.vbs")
+            with open(vbs, "w", encoding="utf-8") as f:
+                f.write('Set sh = CreateObject("WScript.Shell")\r\n')
+                f.write('sh.Run """%s"" ""%s"" --serve", 0, False\r\n'
+                        % (exe, host))
+            cmd = 'wscript.exe //B "%s"' % vbs
+        r = subprocess.run(
+            ["reg", "add", run_key, "/v", value, "/t", "REG_SZ",
+             "/d", cmd, "/f"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return False, "autostart registry write failed"
+    except Exception as e:
+        return False, "autostart failed: %s" % e
+    # Start it now too, so LAN print works before the next login.
+    try:
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        if exe.lower().endswith("python.exe"):
+            flags |= 0x08000000  # CREATE_NO_WINDOW
+        subprocess.Popen([exe, host, "--serve"], cwd=TARGET,
+                         creationflags=flags, close_fds=True)
+    except Exception as e:
+        say("      (will start at next login: %s)" % e)
+    say("      OK — %s" % value)
+    return True, ""
+
+
+def _fw_rule_name(proto, port):
+    return "DataBridge LAN print %s %d" % (proto, port)
+
+
+def _fw_rule_exists(name):
+    try:
+        r = subprocess.run(
+            'netsh advfirewall firewall show rule name="%s"' % name,
+            capture_output=True, text=True, timeout=30)
+        return r.returncode == 0 and "Rule Name" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def add_firewall_rules():
+    """Inbound TCP 55559 + UDP 55557 for LAN print (idempotent)."""
+    say("[7/7] firewall (LAN print)...")
+    rules = [("TCP", 55559), ("UDP", 55557)]
+    cmds = []
+    for proto, port in rules:
+        name = _fw_rule_name(proto, port)
+        cmds.append('netsh advfirewall firewall delete rule name="%s"' % name)
+        cmds.append(
+            'netsh advfirewall firewall add rule name="%s" dir=in '
+            'action=allow protocol=%s localport=%d profile=any enable=yes'
+            % (name, proto, port))
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+    if all(_fw_rule_exists(_fw_rule_name(p, n)) for p, n in rules):
+        say("      OK")
+        return True, ""
+    # A non-admin install cannot add rules — retry once with a UAC prompt.
+    bat = os.path.join(tempfile.gettempdir(), "databridge-firewall.bat")
+    try:
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\n")
+            for cmd in cmds:
+                f.write(cmd + " >nul 2>&1\r\n")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Start-Process -FilePath '%s' -Verb RunAs -Wait -WindowStyle Hidden"
+             % bat],
+            capture_output=True, text=True, timeout=180)
+    except Exception:
+        pass
+    try:
+        os.unlink(bat)
+    except Exception:
+        pass
+    if all(_fw_rule_exists(_fw_rule_name(p, n)) for p, n in rules):
+        say("      OK (elevated)")
+        return True, ""
+    say("      ! skipped — LAN print may be blocked. Allow inbound "
+        "TCP 55559 / UDP 55557 in Windows Firewall.")
+    return False, "firewall"
+
+
 def main(argv):
     say("== DataBridge print host install (Windows, automatic) ==")
     com_override = (argv[0] if len(argv) > 0 else "").strip()
@@ -274,6 +384,12 @@ def main(argv):
     if not ok:
         say("ERROR: " + err)
         return 1
+    ok, err = install_autostart()
+    if not ok:
+        say("WARNING: " + err)
+    ok, err = add_firewall_rules()
+    if not ok:
+        say("WARNING: " + err)
     ok, err = selftest()
     if not ok:
         say("ERROR: " + err)
@@ -281,6 +397,8 @@ def main(argv):
     say()
     say("INSTALL DONE — reload the extension once, then print. "
         "No COM port or ID typing needed.")
+    say("LAN print: this PC keeps sharing its printer after Chrome closes "
+        "(autostart). Other PCs print through it on the same office network.")
     return 0
 
 
