@@ -35,6 +35,24 @@ for private repos, which broke the one-click setup with
 - **tl5x-bt.ppd** — mini PPD (PDF passthrough, 48×80/60×80/80×100/100×150/
   100×180 mm + A4).
 
+## LAN print (one printer, many laptops)
+
+The TL5X can be Bluetooth-connected to one laptop at a time. Every print host
+runs a LAN relay automatically:
+
+- **UDP 55557** — discovery beacon (same office subnet/broadcast domain)
+- **TCP 55559** — HMAC-signed `/relay_print`; a laptop without the printer
+  sends the finished TSPL bytes to the laptop that has it connected
+
+`db-print-host.py --serve` is the autostart coordinator: it keeps the local
+print agent + relay alive even when Chrome/Edge is closed. `install-windows.py`
+registers it in `HKCU\...\Run` and opens the two firewall ports; `install-mac.sh`
+installs the `com.databridge.printhost` LaunchAgent.
+
+Extension → Settings → Printing → **🌐 LAN print** has the toggles (share /
+fallback / only), station name and shared relay key. Use the **same relay key**
+on every laptop; peers with a different key are ignored.
+
 ## Keeping it current
 
 `DataBridge-Extension/release.sh` runs `mirror-native-host.py` automatically
