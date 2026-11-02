@@ -68,6 +68,39 @@ cat > "$NM_DIR/com.databridge.print.json" <<EOF
 EOF
 echo "manifest OK (extension: $EXT_ID)"
 
+# Background print service: keeps the local print agent (55555/55556) and the
+# LAN relay (55559/TCP + 55557/UDP) alive even when Chrome is closed, so other
+# laptops on the same network can print through this Mac's printer.
+PLIST="$HOME/Library/LaunchAgents/com.databridge.printhost.plist"
+LABEL="com.databridge.printhost"
+UID_N="$(id -u)"
+mkdir -p "$HOME/Library/LaunchAgents"
+launchctl bootout "gui/$UID_N/$LABEL" >/dev/null 2>&1 || true
+cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$HOME/bin/db-print-host.py</string>
+    <string>--serve</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/private/tmp/databridge-printhost.out</string>
+  <key>StandardErrorPath</key><string>/private/tmp/databridge-printhost.out</string>
+</dict>
+</plist>
+PLISTEOF
+if ! launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null; then
+  launchctl load -w "$PLIST" 2>/dev/null || true
+fi
+echo "LAN print service OK ($LABEL) — allow incoming connections if macOS asks."
+
 # Ping test through the real native-messaging framing — no printing involved.
 PING_REPLY="$(python3 -c "
 import struct, json, subprocess
