@@ -74,12 +74,24 @@ def save_config(patch):
         except Exception:
             d = {}
         d.update(patch)
-        with open(path, "w", encoding="utf-8") as f:
+        # Atomic replace so the running coordinator's mtime reload can never
+        # read a half-written JSON file.
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f)
+        os.replace(tmp, path)
         global CONFIG
         CONFIG = d
         try:
             _RELAY_KEY_CACHE.update({"key": "", "fp": ""})
+        except Exception:
+            pass
+        try:
+            _apply_relay_config(d)
+        except Exception:
+            pass
+        try:
+            _CONFIG_MTIME["ts"] = os.path.getmtime(path)
         except Exception:
             pass
         return True, ""
@@ -525,6 +537,238 @@ def bt_name_connected(dev, names):
     return False
 
 
+# ── Windows Bluetooth link state ─────────────────────────────────────────
+# A paired-but-off printer still leaves its SPP COM port in the port list, and
+# opening that phantom port can succeed without printing anywhere. Ask the
+# Windows Bluetooth stack which devices are actually connected, then map the
+# COM port back to its device name via BTHENUM + BTHPORT registry keys.
+_WIN_BT_CACHE = {"at": 0.0, "names": None}
+
+
+def _win_bt_connected_names():
+    """Normalised names of connected Bluetooth devices, or None when the
+    Windows Bluetooth API is unavailable (callers then fall back to probing)."""
+    if os.name != "nt":
+        return None
+    if _WIN_BT_CACHE["at"] and time.time() - _WIN_BT_CACHE["at"] < 5:
+        return _WIN_BT_CACHE["names"]
+    names = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [("wYear", wintypes.WORD), ("wMonth", wintypes.WORD),
+                        ("wDayOfWeek", wintypes.WORD), ("wDay", wintypes.WORD),
+                        ("wHour", wintypes.WORD), ("wMinute", wintypes.WORD),
+                        ("wSecond", wintypes.WORD), ("wMilliseconds", wintypes.WORD)]
+
+        class BLUETOOTH_ADDRESS(ctypes.Structure):
+            _fields_ = [("ullLong", ctypes.c_ulonglong)]
+
+        class BLUETOOTH_DEVICE_INFO(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("Address", BLUETOOTH_ADDRESS),
+                        ("ulClassofDevice", wintypes.ULONG),
+                        ("fConnected", wintypes.BOOL),
+                        ("fRemembered", wintypes.BOOL),
+                        ("fAuthenticated", wintypes.BOOL),
+                        ("stLastSeen", SYSTEMTIME),
+                        ("stLastUsed", SYSTEMTIME),
+                        ("szName", wintypes.WCHAR * 248)]
+
+        class BLUETOOTH_DEVICE_SEARCH_PARAMS(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("fReturnAuthenticated", wintypes.BOOL),
+                        ("fReturnRemembered", wintypes.BOOL),
+                        ("fReturnUnknown", wintypes.BOOL),
+                        ("fReturnConnected", wintypes.BOOL),
+                        ("fIssueInquiry", wintypes.BOOL),
+                        ("cTimeoutMultiplier", ctypes.c_ubyte),
+                        ("hRadio", wintypes.HANDLE)]
+
+        bth = None
+        for dll in ("bthprops.cpl", "irprops.cpl"):
+            try:
+                bth = ctypes.WinDLL(dll)
+                break
+            except Exception:
+                bth = None
+        if bth is None:
+            raise OSError("bluetooth API unavailable")
+        bth.BluetoothFindFirstDevice.argtypes = [
+            ctypes.POINTER(BLUETOOTH_DEVICE_SEARCH_PARAMS),
+            ctypes.POINTER(BLUETOOTH_DEVICE_INFO)]
+        bth.BluetoothFindFirstDevice.restype = wintypes.HANDLE
+        bth.BluetoothFindNextDevice.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(BLUETOOTH_DEVICE_INFO)]
+        bth.BluetoothFindNextDevice.restype = wintypes.BOOL
+        bth.BluetoothFindDeviceClose.argtypes = [wintypes.HANDLE]
+
+        params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+        params.dwSize = ctypes.sizeof(params)
+        params.fReturnAuthenticated = True
+        params.fReturnRemembered = True
+        params.fReturnUnknown = False
+        params.fReturnConnected = True
+        params.fIssueInquiry = False
+        params.cTimeoutMultiplier = 0
+        info = BLUETOOTH_DEVICE_INFO()
+        info.dwSize = ctypes.sizeof(info)
+        found = set()
+        h = bth.BluetoothFindFirstDevice(ctypes.byref(params), ctypes.byref(info))
+        if h:
+            try:
+                while True:
+                    if info.fConnected:
+                        n = _norm_name(info.szName)
+                        if n:
+                            found.add(n)
+                    info.dwSize = ctypes.sizeof(info)
+                    if not bth.BluetoothFindNextDevice(h, ctypes.byref(info)):
+                        break
+            finally:
+                try:
+                    bth.BluetoothFindDeviceClose(h)
+                except Exception:
+                    pass
+        names = found
+    except Exception:
+        names = None
+    _WIN_BT_CACHE.update(at=time.time(), names=names)
+    return names
+
+
+def _win_bt_name_from_mac(mac):
+    try:
+        import winreg
+        path = (r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters"
+                r"\Devices\%s" % str(mac).lower())
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+            for value in ("Name", "FriendlyName"):
+                try:
+                    data, _typ = winreg.QueryValueEx(k, value)
+                except OSError:
+                    continue
+                txt = (data.decode("utf-8", "ignore")
+                       if isinstance(data, bytes) else str(data))
+                txt = txt.replace("\x00", "").strip()
+                if txt:
+                    return txt
+    except Exception:
+        pass
+    return None
+
+
+def _win_com_bt_name(dev):
+    """Cached COM-port → Bluetooth device-name lookup (registry scan is cheap
+    but not free; pairing changes are picked up within 30s)."""
+    port = str(dev or "").strip().upper()
+    if not port:
+        return None
+    ent = _WIN_COM_NAME_CACHE.get(port)
+    if ent and time.time() - ent[0] < 30:
+        return ent[1]
+    name = _win_com_bt_name_raw(dev)
+    _WIN_COM_NAME_CACHE[port] = (time.time(), name)
+    return name
+
+
+def _win_com_bt_name_raw(dev):
+    """Map a Bluetooth SPP COM port (e.g. COM5) to its paired device name.
+    None when the registry layout cannot be resolved (caller falls back)."""
+    if os.name != "nt":
+        return None
+    try:
+        import re as _re
+        import winreg
+        port = str(dev or "").strip().upper()
+        if not port:
+            return None
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                              r"SYSTEM\CurrentControlSet\Enum\BTHENUM")
+    except Exception:
+        return None
+    try:
+        services = []
+        i = 0
+        while True:
+            try:
+                services.append(winreg.EnumKey(root, i))
+            except OSError:
+                break
+            i += 1
+        for svc in services:
+            try:
+                skey = winreg.OpenKey(root, svc)
+            except OSError:
+                continue
+            try:
+                j = 0
+                while True:
+                    try:
+                        inst = winreg.EnumKey(skey, j)
+                    except OSError:
+                        break
+                    j += 1
+                    try:
+                        ikey = winreg.OpenKey(skey, inst)
+                    except OSError:
+                        continue
+                    try:
+                        try:
+                            pn, _ = winreg.QueryValueEx(ikey, "PortName")
+                        except OSError:
+                            pn = None
+                        if pn and str(pn).strip().upper() == port:
+                            m = _re.search(r"&([0-9A-Fa-f]{12})(?:_[0-9A-Fa-f]+)?$",
+                                           inst)
+                            if m:
+                                name = _win_bt_name_from_mac(m.group(1))
+                                if name:
+                                    return name
+                            try:
+                                fn, _ = winreg.QueryValueEx(ikey, "FriendlyName")
+                            except OSError:
+                                fn = None
+                            if fn:
+                                fn = str(fn)
+                                if "serial over bluetooth" not in fn.lower():
+                                    return fn
+                    finally:
+                        try:
+                            winreg.CloseKey(ikey)
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    winreg.CloseKey(skey)
+                except Exception:
+                    pass
+    finally:
+        try:
+            winreg.CloseKey(root)
+        except Exception:
+            pass
+    return None
+
+
+def _win_bt_verify(dev):
+    """(known, connected) for a Windows Bluetooth COM port.
+    known=False means the stack could not answer — fall back to probing."""
+    live = _win_bt_connected_names()
+    if live is None:
+        return False, False
+    name = _win_com_bt_name(dev)
+    want = _norm_name(name)
+    if not want:
+        return False, False
+    for n in live:
+        if n == want or (len(n) >= 5 and (n in want or want in n)):
+            return True, True
+    return True, False
+
+
 def device_connected(dev):
     """(connected, reason) — real reachability, not just a /dev node.
     reason: warm | bluetooth | cable | paired-not-connected | not-found |
@@ -542,6 +786,10 @@ def device_connected(dev):
         if bt_name_connected(dev, paired):
             return False, "paired-not-connected"
         return False, "not-found"
+    if ctype == "bluetooth" and os.name == "nt":
+        known, live = _win_bt_verify(dev)
+        if known:
+            return (True, "bluetooth") if live else (False, "paired-not-connected")
     if ctype == "cable":
         return (True, "cable") if os.path.exists(dev) else (False, "not-found")
     if os.name == "nt":
@@ -698,7 +946,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 7
+HOST_VERSION = 8
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -1763,6 +2011,19 @@ def _do_print(p, _meta=None):
             if pref == "auto" or pconn == pref:
                 cands.append((pdev, pconn))
         disc = discover_printers()
+        if os.name == "nt":
+            # Drop Bluetooth COM ports Windows positively reports as
+            # disconnected: the node stays listed while the printer sleeps and
+            # a write to it "succeeds" without printing anywhere (which would
+            # also stop this laptop from relaying to the real station).
+            filtered = []
+            for d, c in disc:
+                if c == "bluetooth":
+                    known, live = _win_bt_verify(d)
+                    if known and not live:
+                        continue
+                filtered.append((d, c))
+            disc = filtered
         if pref in ("auto", "bt"):
             cands += [c for c in disc if c[1] == "bluetooth"]
         if pref in ("auto", "cable"):
@@ -1903,6 +2164,10 @@ RELAY_KEY_DEFAULT = "dbprint-lan-v1"
 RELAY_STATION = str(CONFIG.get("relay_station") or "").strip()
 NODE_NAME = (str(CONFIG.get("node_name") or "").strip()
              or socket.gethostname() or "databridge")[:40]
+RELAY_SHARE = True
+RELAY_USE = True
+RELAY_BLOCK = []
+RELAY_SCOPE = ""
 RELAY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "db-print-relay.log")
 RELAY_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1914,6 +2179,74 @@ _RELAY_PEERS_LOCK = threading.Lock()
 _RELAY_KEY_CACHE = {"key": "", "fp": ""}
 _CONN_CACHE = {"ts": 0.0, "ok": False, "why": ""}
 _HTTP_FAIL_TS = {"ts": 0.0}
+_CONFIG_MTIME = {"ts": 0.0}
+
+
+def _bool_cfg(v, default=True):
+    s = str(v).strip().lower()
+    if s == "":
+        return bool(default)
+    return s not in ("0", "false", "off", "no")
+
+
+def _relay_block_list(v):
+    """Node names the user switched OFF in this extension window."""
+    if isinstance(v, str):
+        items = v.replace(";", ",").split(",")
+    elif isinstance(v, (list, tuple)):
+        items = list(v)
+    else:
+        items = []
+    out = []
+    for x in items:
+        s = str(x or "").strip()[:40]
+        if s and s not in out:
+            out.append(s)
+    return out[:50]
+
+
+def _apply_relay_config(d=None):
+    """Re-read the LAN keys into globals (also used by the live coordinator)."""
+    global RELAY_ENABLED, RELAY_ONLY, RELAY_SHARE, RELAY_USE
+    global RELAY_BLOCK, RELAY_SCOPE, RELAY_STATION, NODE_NAME
+    if not isinstance(d, dict):
+        d = CONFIG
+    RELAY_ENABLED = _bool_cfg(d.get("relay_enabled", True), True)
+    RELAY_ONLY = _bool_cfg(d.get("relay_only", False), False)
+    RELAY_SHARE = RELAY_ENABLED and _bool_cfg(d.get("relay_share", True), True)
+    RELAY_USE = RELAY_ENABLED and _bool_cfg(d.get("relay_use", True), True)
+    RELAY_BLOCK = _relay_block_list(d.get("relay_block"))
+    RELAY_SCOPE = str(d.get("relay_scope") or "").strip()[:40]
+    RELAY_STATION = str(d.get("relay_station") or "").strip()[:40]
+    NODE_NAME = (str(d.get("node_name") or "").strip()
+                 or socket.gethostname() or "databridge")[:40]
+
+
+def _maybe_reload_config():
+    """Pick up toggles saved by another host process (Chrome ⇄ coordinator).
+
+    The autostart --serve process owns the relay and printer, while the
+    extension's Settings toggle is saved by the Chrome-spawned host. A cheap
+    mtime check keeps both in sync without restarting the service.
+    """
+    global CONFIG
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "db-print-config.json")
+        m = os.path.getmtime(path)
+        if not m or m == _CONFIG_MTIME.get("ts"):
+            return
+        d = load_config()
+        if isinstance(d, dict):
+            CONFIG = d
+            _apply_relay_config(d)
+            _RELAY_KEY_CACHE.update({"key": "", "fp": ""})
+            _CONFIG_MTIME["ts"] = m
+    except Exception:
+        pass
+
+
+_apply_relay_config(CONFIG)
 
 
 def relay_log(msg):
@@ -2125,6 +2458,12 @@ def _peer_list():
                 continue
             if not p.get("port"):
                 continue
+            if p.get("share") is False:
+                continue  # that laptop switched LAN sharing off
+            if RELAY_SCOPE and str(p.get("scope") or "") != RELAY_SCOPE:
+                continue  # different office/team scope
+            if str(p.get("node") or "") in RELAY_BLOCK:
+                continue  # user blocked this station
             # A probe can miss a sleeping-but-paired printer, so keep peers
             # that merely have a printer configured ("pinned") as fallbacks.
             if p.get("connected") or p.get("warm") or p.get("pinned"):
@@ -2142,7 +2481,42 @@ def _peer_list():
     return out
 
 
+def _relay_public():
+    """Everything the extension's LAN print panel needs to render/save."""
+    peers = []
+    for p in _peer_list():
+        peers.append({
+            "node": p.get("node"),
+            "device": p.get("device") or "",
+            "addr": p.get("addr") or "",
+            "port": p.get("port"),
+            "connected": bool(p.get("connected")),
+            "warm": bool(p.get("warm")),
+            "pinned": bool(p.get("pinned")),
+            "share": p.get("share") is not False,
+            "scope": p.get("scope") or "",
+            "age": round(time.time() - float(p.get("last_seen") or 0.0), 1),
+        })
+    return {
+        "enabled": bool(RELAY_ENABLED),
+        "share": bool(RELAY_SHARE),
+        "use": bool(RELAY_USE),
+        "only": bool(RELAY_ONLY),
+        "node": NODE_NAME,
+        "key_fp": relay_key_fp(),
+        "key_is_default": relay_key() == RELAY_KEY_DEFAULT,
+        "station": RELAY_STATION,
+        "scope": RELAY_SCOPE,
+        "block": list(RELAY_BLOCK),
+        "tcp_port": RELAY_TCP_PORT,
+        "udp_port": RELAY_UDP_PORT,
+        "serve": bool(_RELAY_SERVER_BOUND),
+        "peers": peers,
+    }
+
+
 def relay_status():
+    _maybe_reload_config()
     if not _RELAY_SERVER_BOUND:
         try:
             with urllib.request.urlopen(
@@ -2154,29 +2528,32 @@ def relay_status():
                 return remote
         except Exception:
             pass
-    peers = []
-    for p in _peer_list():
-        peers.append({
-            "node": p.get("node"),
-            "device": p.get("device") or "",
-            "addr": p.get("addr") or "",
-            "port": p.get("port"),
-            "connected": bool(p.get("connected")),
-            "warm": bool(p.get("warm")),
-            "pinned": bool(p.get("pinned")),
-            "age": round(time.time() - float(p.get("last_seen") or 0.0), 1),
-        })
-    return {
-        "enabled": bool(RELAY_ENABLED),
-        "node": NODE_NAME,
-        "key_fp": relay_key_fp(),
-        "serve": bool(_RELAY_SERVER_BOUND),
-        "relay_only": bool(RELAY_ONLY),
-        "station": RELAY_STATION,
-        "local_connected": bool(_CONN_CACHE.get("ok")),
-        "local_reason": _CONN_CACHE.get("why") or "",
-        "peers": peers,
-    }
+    out = _relay_public()
+    out["local_connected"] = bool(_CONN_CACHE.get("ok"))
+    out["local_reason"] = _CONN_CACHE.get("why") or ""
+    return out
+
+
+def set_relay_config(msg):
+    """Save the LAN print panel's toggles/key into db-print-config.json."""
+    patch = {}
+    for key in ("relay_enabled", "relay_share", "relay_use", "relay_only"):
+        if msg.get(key) is not None:
+            patch[key] = _bool_cfg(msg.get(key), True)
+    for key, limit in (("node_name", 40), ("relay_station", 40),
+                       ("relay_scope", 40)):
+        if msg.get(key) is not None:
+            patch[key] = str(msg.get(key) or "").strip()[:limit]
+    if msg.get("relay_key") is not None:
+        patch["relay_key"] = str(msg.get("relay_key") or "").strip()[:128]
+    if msg.get("relay_block") is not None:
+        patch["relay_block"] = _relay_block_list(msg.get("relay_block"))
+    ok, err = save_config(patch)
+    if not ok:
+        return {"ok": False, "error": "config save failed: " + err}
+    out = _relay_public()
+    out["ok"] = True
+    return out
 
 
 def _forward_to_coordinator(tspl):
@@ -2226,6 +2603,8 @@ _RELAY_OPENER = urllib.request.build_opener(_NoRedirect)
 def relay_to_peer(tspl, prefer=None):
     if not RELAY_ENABLED:
         return {"ok": False, "error": "LAN relay disabled"}
+    if not RELAY_USE:
+        return {"ok": False, "error": "LAN print use is off on this laptop"}
     peers = _peer_list()
     if prefer:
         peers.sort(key=lambda x: x.get("node") != prefer)
@@ -2313,6 +2692,10 @@ class _RelayHTTPHandler(http.server.BaseHTTPRequestHandler):
                     return
                 res = do_print({"_tspl": body})
             else:
+                if not RELAY_SHARE:
+                    self._json(403, {"ok": False,
+                                     "error": "this laptop is not sharing its printer"})
+                    return
                 node = str(self.headers.get("X-DB-Node") or "")
                 ts = str(self.headers.get("X-DB-Time") or "")
                 sig = str(self.headers.get("X-DB-Sign") or "")
@@ -2341,6 +2724,8 @@ def _beacon_payload():
                        or CONFIG.get("bluetooth")),
         "why": _CONN_CACHE.get("why") or "",
         "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
+        "share": bool(RELAY_SHARE),
+        "scope": RELAY_SCOPE,
         "version": HOST_VERSION,
         "ts": time.time(),
     }
@@ -2369,6 +2754,7 @@ def _relay_beacon_loop():
         try:
             now = time.time()
             if now - last_send >= RELAY_BEACON_SECS:
+                _maybe_reload_config()
                 _conn_cache_refresh(False)
                 beacon = _beacon_payload()
                 data = json.dumps(beacon).encode("utf-8")
@@ -2422,6 +2808,8 @@ def _relay_beacon_loop():
                     "pinned": bool(m.get("pinned")),
                     "why": m.get("why") or "",
                     "device": m.get("device") or "",
+                    "share": m.get("share") is not False,
+                    "scope": str(m.get("scope") or ""),
                     "version": m.get("version") or 0,
                     "last_seen": time.time(),
                 }
@@ -2480,6 +2868,7 @@ def _coordinator_watch():
 
 def handle(msg):
     action = (msg.get("action") or "").strip()
+    _maybe_reload_config()
     if action == "ping":
         # Never probe every COM port here: phantom Bluetooth ports take ~3s
         # per baud each, which pushed ping past the extension timeout and
@@ -2519,6 +2908,12 @@ def handle(msg):
                 "border": bool(CONFIG.get("border", False)),
                 "relay": relay,
                 "printers": printers}
+    if action == "get_relay_config":
+        out = _relay_public()
+        out["ok"] = True
+        return out
+    if action == "set_relay_config":
+        return set_relay_config(msg)
     if action == "driver_status":
         return driver_status()
     if action == "driver_test":
