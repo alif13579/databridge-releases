@@ -47,6 +47,7 @@ import urllib.error
 import urllib.request
 import hashlib
 import hmac
+import uuid
 
 
 def load_config():
@@ -2267,8 +2268,46 @@ RELAY_PEER_TTL = 20.0
 RELAY_TIMEOUT = 45
 RELAY_KEY_DEFAULT = "dbprint-lan-v1"
 RELAY_STATION = str(CONFIG.get("relay_station") or "").strip()
-NODE_NAME = (str(CONFIG.get("node_name") or "").strip()
-             or socket.gethostname() or "databridge")[:40]
+
+
+# ── Automatic LAN identity (no manual naming needed) ─────────────────────
+# Every laptop gets a stable, human-friendly, collision-free name derived
+# from its hostname + a short machine tag (MAC). Users may still override
+# it in Settings; an empty node_name means "keep it automatic".
+_GENERIC_HOSTNAMES = {"localhost", "macbook", "macbookpro", "macbook-pro",
+                      "desktop", "laptop", "pc", "computer", "databridge",
+                      "windows", "user"}
+
+
+def _machine_tag():
+    """Stable 4-char tag from the machine's MAC/uuid node — same every run."""
+    try:
+        node = uuid.getnode()
+        if node and not (node >> 40) & 1:  # ignore random multicast MACs
+            return hashlib.sha256(str(node).encode("utf-8")).hexdigest()[:4].upper()
+    except Exception:
+        pass
+    return hashlib.sha256((socket.gethostname() or "databridge")
+                          .encode("utf-8")).hexdigest()[:4].upper()
+
+
+def auto_node_name():
+    """Unique default laptop name — hostname + tag, e.g. ALIFS-MBP-A1B2."""
+    h = str(socket.gethostname() or "").strip().split(".")[0]
+    h = re.sub(r"[^A-Za-z0-9_-]+", "-", h).strip("-") or "Laptop"
+    base = h[:30].upper()
+    # Always add the tag: cloned/duplicate hostnames are common in offices
+    # and peers are keyed by node name, so two "MacBook-Pro" would collide.
+    return ("%s-%s" % (base, _machine_tag()))[:40]
+
+
+def resolve_node_name(configured=""):
+    """Configured name wins; empty means use the automatic one."""
+    name = str(configured or "").strip()
+    return (name or auto_node_name())[:40]
+
+
+NODE_NAME = resolve_node_name(CONFIG.get("node_name"))
 RELAY_SHARE = True
 RELAY_USE = True
 RELAY_BLOCK = []
@@ -2332,8 +2371,7 @@ def _apply_relay_config(d=None):
     RELAY_BLOCK = _relay_block_list(d.get("relay_block"))
     RELAY_SCOPE = str(d.get("relay_scope") or "").strip()[:40]
     RELAY_STATION = str(d.get("relay_station") or "").strip()[:40]
-    NODE_NAME = (str(d.get("node_name") or "").strip()
-                 or socket.gethostname() or "databridge")[:40]
+    NODE_NAME = resolve_node_name(d.get("node_name"))
 
 
 def _maybe_reload_config():
@@ -2636,6 +2674,9 @@ def _relay_public():
         "use": bool(RELAY_USE),
         "only": bool(RELAY_ONLY),
         "node": NODE_NAME,
+        "node_auto": not bool(str(CONFIG.get("node_name") or "").strip()),
+        "auto_name": auto_node_name(),
+        "station_auto": not bool(RELAY_STATION),
         "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
         "device_name": printer_name(CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT),
         "key_fp": relay_key_fp(),
