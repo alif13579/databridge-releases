@@ -473,6 +473,56 @@ def discover_printers():
     return found
 
 
+_PRINTER_NAME_CACHE = {}
+
+
+def printer_name(dev):
+    """Human-friendly printer name for a device path (ledger + UI).
+
+    Tries the paired Bluetooth name, then the Windows COM description, then
+    a cleaned-up device basename. Never raises, always returns a short string.
+    Cached 60s so the 5s beacon loop never re-runs system_profiler.
+    """
+    dev = str(dev or "")
+    if not dev:
+        return ""
+    ent = _PRINTER_NAME_CACHE.get(dev)
+    if ent and time.time() - ent[0] < 60:
+        return ent[1]
+
+    def resolve():
+        # Paired/connected Bluetooth names (macOS system_profiler, cached).
+        try:
+            connected, paired = bt_link_lists()
+            for n in (connected or []) + (paired or []):
+                if bt_name_connected(dev, [n]):
+                    return str(n)[:60]
+        except Exception:
+            pass
+        # Windows SPP COM port → paired device name / USB description.
+        if os.name == "nt":
+            try:
+                n = _win_com_bt_name(dev)
+                if n:
+                    return str(n)[:60]
+            except Exception:
+                pass
+            try:
+                from serial.tools import list_ports
+                for p in list_ports.comports():
+                    if p.device == dev and p.description:
+                        return str(p.description)[:60]
+            except Exception:
+                pass
+        # Fallback: "cu.TL5XBTPrinter" → "TL5XBTPrinter".
+        base = os.path.basename(dev)
+        return (base[3:] if base.startswith("cu.") else base)[:60]
+
+    name = resolve()
+    _PRINTER_NAME_CACHE[dev] = (time.time(), name)
+    return name
+
+
 # ── Real connection status ───────────────────────────────────────────────
 # macOS keeps /dev/cu.TL5XBTPrinter around while the printer is paired even
 # when it is powered off — so "a device node exists" is NOT "connected".
@@ -1970,7 +2020,7 @@ def _do_print(p, _meta=None):
     if RELAY_ENABLED and RELAY_ONLY and not no_relay:
         # This laptop is a client by config: ignore any local/false COM port
         # and always send the bytes to the laptop that has the printer.
-        return relay_to_peer(tspl)
+        return relay_to_peer(tspl, consignment=p.get("consignment"))
     # One local coordinator per machine. A paired printer can look unreachable
     # for a moment while the Bluetooth link wakes, so local attempts below
     # still include the full candidate list. If every local candidate fails,
@@ -2073,7 +2123,8 @@ def _do_print(p, _meta=None):
                 last = "%s @%s: %s" % (dev, baud, e)
         tried.append(dev)
     if RELAY_ENABLED and not no_relay:
-        rr = relay_to_peer(tspl, prefer=CONFIG.get("relay_station"))
+        rr = relay_to_peer(tspl, prefer=CONFIG.get("relay_station"),
+                           consignment=p.get("consignment"))
         if rr.get("ok"):
             return rr
         if rr.get("error"):
@@ -2082,10 +2133,37 @@ def _do_print(p, _meta=None):
 
 
 def do_print(p):
-    """Serialize native and local-service prints on the single hot port."""
+    """Serialize native and local-service prints on the single hot port.
+
+    Also records one ledger entry per job (origin node, consignment, printer,
+    result, timing) and exposes the in-flight job via _CURRENT_JOB.
+    """
+    global _JOB_SEQ, _CURRENT_JOB
+    with _JOBS_LOCK:
+        _JOB_SEQ += 1
+        started = time.time()
+        job = {
+            "id": "j%d-%d" % (int(started), _JOB_SEQ),
+            "ts": round(started, 1),
+            "origin": str(p.get("_origin") or NODE_NAME)[:40],
+            "node": NODE_NAME,
+            "consignment": str(p.get("consignment") or p.get("_consignment") or "")[:40],
+            "device": str(p.get("device") or CONFIG.get("preferred") or DEVICE_DEFAULT)[:80],
+            "device_name": "",
+            "via": "local",
+            "relayed_to": "",
+            "ok": False, "bytes": 0, "ms": 0, "error": "",
+        }
     meta = {}
-    with PRINT_LOCK:
-        res = _do_print(p, meta)
+    try:
+        with PRINT_LOCK:
+            with _JOBS_LOCK:
+                _CURRENT_JOB = job
+            res = _do_print(p, meta)
+    finally:
+        with _JOBS_LOCK:
+            if _CURRENT_JOB is job:
+                _CURRENT_JOB = None
     try:
         if res.get("ok") and meta.get("tspl"):
             extra = {"path": "site-html" if p.get("_tspl") is not None else "tspl"}
@@ -2112,6 +2190,33 @@ def do_print(p):
         elif not res.get("ok"):
             _CONN_CACHE.update(ts=time.time(), ok=False,
                                why=str(res.get("error") or "")[:80])
+    except Exception:
+        pass
+    # ── ledger: one row per finished job ─────────────────────────────────
+    try:
+        with _JOBS_LOCK:
+            job["ok"] = bool(res.get("ok"))
+            job["bytes"] = int(res.get("bytes") or len(meta.get("tspl") or b""))
+            job["ms"] = int((time.time() - started) * 1000)
+            job["error"] = str(res.get("error") or "")[:160]
+            job["device_name"] = printer_name(res.get("device") or job["device"])
+            if res.get("relay"):
+                job["via"] = "lan-client"      # this laptop forwarded to a peer
+            elif p.get("_origin"):
+                job["via"] = "lan-server"      # a peer sent this job here
+            elif res.get("via_local_service"):
+                job["via"] = "local-service"
+            if res.get("relayed_to"):
+                job["relayed_to"] = str(res["relayed_to"])[:40]
+            _JOBS.insert(0, job)
+            del _JOBS[100:]
+    except Exception:
+        pass
+    try:
+        relay_log("job %s %s %s cons=%s via=%s %dms %s"
+                  % (job["id"], "OK" if job["ok"] else "FAIL",
+                     job["origin"], job["consignment"] or "-", job["via"],
+                     job["ms"], job["error"]))
     except Exception:
         pass
     return res
@@ -2180,6 +2285,15 @@ _RELAY_KEY_CACHE = {"key": "", "fp": ""}
 _CONN_CACHE = {"ts": 0.0, "ok": False, "why": ""}
 _HTTP_FAIL_TS = {"ts": 0.0}
 _CONFIG_MTIME = {"ts": 0.0}
+
+# ── Print job ledger (who printed what, and the in-flight job) ────────────
+# Bounded in-memory ring; the autostart --serve host keeps the last 100 jobs
+# for the extension's Print activity panel. Each job is also appended to the
+# relay log so a restart never loses the audit trail.
+_JOBS_LOCK = threading.Lock()
+_JOBS = []              # newest first, max 100
+_JOB_SEQ = 0
+_CURRENT_JOB = None
 
 
 def _bool_cfg(v, default=True):
@@ -2482,27 +2596,48 @@ def _peer_list():
 
 
 def _relay_public():
-    """Everything the extension's LAN print panel needs to render/save."""
+    """Everything the extension's LAN print panel needs to render/save.
+
+    Shows every live LAN peer (even a laptop with no printer), so the user can
+    answer "who is on the network". Relay routing still uses _peer_list(),
+    which keeps only peers that can actually print.
+    """
     peers = []
-    for p in _peer_list():
+    now = time.time()
+    with _RELAY_PEERS_LOCK:
+        raw = [dict(p) for p in list(_RELAY_PEERS.values())
+               if now - float(p.get("last_seen") or 0.0) <= RELAY_PEER_TTL]
+    for p in raw:
+        if str(p.get("node") or "") in RELAY_BLOCK:
+            continue  # shown in the blocked section of the panel
+        if RELAY_SCOPE and str(p.get("scope") or "") != RELAY_SCOPE:
+            continue
         peers.append({
             "node": p.get("node"),
             "device": p.get("device") or "",
+            "device_name": str(p.get("device_name") or "")[:60]
+                           or printer_name(p.get("device")),
             "addr": p.get("addr") or "",
             "port": p.get("port"),
             "connected": bool(p.get("connected")),
             "warm": bool(p.get("warm")),
             "pinned": bool(p.get("pinned")),
             "share": p.get("share") is not False,
+            "can_print": bool(p.get("connected") or p.get("warm") or p.get("pinned")),
             "scope": p.get("scope") or "",
-            "age": round(time.time() - float(p.get("last_seen") or 0.0), 1),
+            "why": p.get("why") or "",
+            "version": p.get("version") or 0,
+            "age": round(now - float(p.get("last_seen") or 0.0), 1),
         })
+    peers.sort(key=lambda x: (not x.get("can_print"), not x.get("connected")))
     return {
         "enabled": bool(RELAY_ENABLED),
         "share": bool(RELAY_SHARE),
         "use": bool(RELAY_USE),
         "only": bool(RELAY_ONLY),
         "node": NODE_NAME,
+        "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
+        "device_name": printer_name(CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT),
         "key_fp": relay_key_fp(),
         "key_is_default": relay_key() == RELAY_KEY_DEFAULT,
         "station": RELAY_STATION,
@@ -2600,7 +2735,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _RELAY_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def relay_to_peer(tspl, prefer=None):
+def relay_to_peer(tspl, prefer=None, consignment=None):
     if not RELAY_ENABLED:
         return {"ok": False, "error": "LAN relay disabled"}
     if not RELAY_USE:
@@ -2627,6 +2762,7 @@ def relay_to_peer(tspl, prefer=None):
             headers={"Content-Type": "application/octet-stream",
                      "X-DB-Node": NODE_NAME,
                      "X-DB-Time": ts,
+                     "X-DB-Consignment": str(consignment or "")[:40],
                      "X-DB-Sign": _relay_sign(NODE_NAME, ts, tspl)})
         try:
             with _RELAY_OPENER.open(req, timeout=RELAY_TIMEOUT) as r:
@@ -2703,7 +2839,11 @@ class _RelayHTTPHandler(http.server.BaseHTTPRequestHandler):
                     self._json(403, {"ok": False, "error": "bad relay signature"})
                     return
                 relay_log("relay job from %s: %d bytes" % (node, len(body)))
-                res = do_print({"_tspl": body, "_no_relay": True})
+                res = do_print({
+                    "_tspl": body, "_no_relay": True,
+                    "_origin": node,
+                    "_consignment": str(self.headers.get("X-DB-Consignment") or "")[:40],
+                })
             res = dict(res)
             res["node"] = NODE_NAME
             self._json(200 if res.get("ok") else 500, res)
@@ -2724,6 +2864,7 @@ def _beacon_payload():
                        or CONFIG.get("bluetooth")),
         "why": _CONN_CACHE.get("why") or "",
         "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
+        "device_name": printer_name(CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT),
         "share": bool(RELAY_SHARE),
         "scope": RELAY_SCOPE,
         "version": HOST_VERSION,
@@ -2808,6 +2949,8 @@ def _relay_beacon_loop():
                     "pinned": bool(m.get("pinned")),
                     "why": m.get("why") or "",
                     "device": m.get("device") or "",
+                    "device_name": str(m.get("device_name") or "")[:60]
+                                   or printer_name(m.get("device")),
                     "share": m.get("share") is not False,
                     "scope": str(m.get("scope") or ""),
                     "version": m.get("version") or 0,
@@ -2912,6 +3055,14 @@ def handle(msg):
         out = _relay_public()
         out["ok"] = True
         return out
+    if action == "print_history":
+        with _JOBS_LOCK:
+            cur = dict(_CURRENT_JOB) if _CURRENT_JOB else None
+            history = [dict(j) for j in _JOBS[:50]]
+        ok_n = sum(1 for j in history if j.get("ok"))
+        return {"ok": True, "current": cur, "history": history,
+                "counts": {"total": len(history), "ok": ok_n,
+                           "failed": len(history) - ok_n}}
     if action == "set_relay_config":
         return set_relay_config(msg)
     if action == "driver_status":
