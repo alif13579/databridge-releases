@@ -69,8 +69,9 @@ EOF
 echo "manifest OK (extension: $EXT_ID)"
 
 # Background print service: keeps the local print agent (55555/55556) and the
-# LAN relay (55559/TCP + 55557/UDP) alive even when Chrome is closed, so other
-# laptops on the same network can print through this Mac's printer.
+# loopback print bridge alive even when Chrome is closed, so printing keeps
+# working in the background. It listens on 127.0.0.1 only — nothing is exposed
+# to the network.
 PLIST="$HOME/Library/LaunchAgents/com.databridge.printhost.plist"
 LABEL="com.databridge.printhost"
 UID_N="$(id -u)"
@@ -99,7 +100,7 @@ PLISTEOF
 if ! launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null; then
   launchctl load -w "$PLIST" 2>/dev/null || true
 fi
-echo "LAN print service OK ($LABEL) — allow incoming connections if macOS asks."
+echo "Background print service OK ($LABEL) — local only, no network access."
 
 # Ping test through the real native-messaging framing — no printing involved.
 PING_REPLY="$(python3 -c "

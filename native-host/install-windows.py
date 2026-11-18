@@ -47,7 +47,7 @@ def ext_root():
 
 
 def ensure_deps():
-    say("[1/7] python deps (pyserial + pillow + qrcode + python-barcode)...")
+    say("[1/6] python deps (pyserial + pillow + qrcode + python-barcode)...")
     # Embedded/portable Pythons have no user site — retry without --user.
     for args in (["--user", "--quiet"], ["--quiet"]):
         try:
@@ -68,7 +68,7 @@ def detect_com(override=""):
     """Returns (port or '', how). Only pins a fixed port when confident
     (TL5X-named or a single bluetooth candidate) — otherwise the host scans
     all ports at print time, so guessing wrong is worse than not guessing."""
-    say("[2/7] printer COM port scan...")
+    say("[2/6] printer COM port scan...")
     if override:
         say("      override: %s" % override)
         return override, "manual override"
@@ -134,7 +134,7 @@ def ids_from_prefs(prefs_path, root):
 
 
 def detect_ids(extra=""):
-    say("[3/7] extension ID detect...")
+    say("[3/6] extension ID detect...")
     root = ext_root()
     local = os.environ.get("LOCALAPPDATA", "")
     cands = [
@@ -162,8 +162,28 @@ def detect_ids(extra=""):
     return ids
 
 
+def stop_existing_hosts():
+    """Stop old print-host processes before replacing the file.
+
+    Without this an already-running --serve process keeps the OLD code (and
+    the old serial port) alive after an update, so fixes never take effect
+    until the next reboot.
+    """
+    ps = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -like '*db-print-host.py*' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, text=True, timeout=60)
+    except Exception:
+        pass
+
+
 def install_files(com_port):
-    say("[4/7] installing host files...")
+    say("[4/6] installing host files...")
     def host_source():
         here = os.path.dirname(os.path.abspath(__file__))
         local = os.path.join(here, "db-print-host.py")
@@ -195,6 +215,13 @@ def install_files(com_port):
             cfg = {}
         if com_port:
             cfg["bluetooth"] = com_port
+        # LAN print was removed in 7.4.116 — strip its stale keys so an old
+        # relay_only/relay_key can never affect printing again.
+        for stale in ("relay_enabled", "relay_share", "relay_use",
+                      "relay_only", "relay_key", "relay_station",
+                      "relay_block", "relay_scope", "relay_port",
+                      "relay_discovery_port", "node_name"):
+            cfg.pop(stale, None)
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
         with open(os.path.join(TARGET, "db-print-host.bat"), "w") as f:
@@ -207,7 +234,7 @@ def install_files(com_port):
 
 
 def register(ids):
-    say("[5/7] registering with Chrome + Edge...")
+    say("[5/6] registering with Chrome + Edge...")
     manifest = os.path.join(TARGET, HOST_NAME + ".json")
     origins = ["chrome-extension://%s/" % i for i in ids]
     try:
@@ -264,9 +291,9 @@ def host_exe():
 
 
 def install_autostart():
-    """Run `db-print-host.py --serve` at login so other laptops can print
-    through this one even when Chrome/Edge is closed."""
-    say("[6/7] LAN print autostart...")
+    """Run `db-print-host.py --serve` at login so printing keeps working
+    even when Chrome/Edge is closed."""
+    say("[6/6] background print service...")
     host = os.path.join(TARGET, "db-print-host.py")
     exe = host_exe()
     value = "DataBridgePrintHost"
@@ -290,7 +317,7 @@ def install_autostart():
             return False, "autostart registry write failed"
     except Exception as e:
         return False, "autostart failed: %s" % e
-    # Start it now too, so LAN print works before the next login.
+    # Start it now too, so background printing works before the next login.
     try:
         flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
         if exe.lower().endswith("python.exe"):
@@ -303,64 +330,16 @@ def install_autostart():
     return True, ""
 
 
-def _fw_rule_name(proto, port):
-    return "DataBridge LAN print %s %d" % (proto, port)
-
-
-def _fw_rule_exists(name):
-    try:
-        r = subprocess.run(
-            'netsh advfirewall firewall show rule name="%s"' % name,
-            capture_output=True, text=True, timeout=30)
-        return r.returncode == 0 and "Rule Name" in (r.stdout or "")
-    except Exception:
-        return False
-
-
-def add_firewall_rules():
-    """Inbound TCP 55559 + UDP 55557 for LAN print (idempotent)."""
-    say("[7/7] firewall (LAN print)...")
-    rules = [("TCP", 55559), ("UDP", 55557)]
-    cmds = []
-    for proto, port in rules:
-        name = _fw_rule_name(proto, port)
-        cmds.append('netsh advfirewall firewall delete rule name="%s"' % name)
-        cmds.append(
-            'netsh advfirewall firewall add rule name="%s" dir=in '
-            'action=allow protocol=%s localport=%d profile=any enable=yes'
-            % (name, proto, port))
-    for cmd in cmds:
+def remove_legacy_firewall_rules():
+    """Best effort: delete inbound rules left by pre-7.4.116 LAN installs."""
+    for name in ("DataBridge LAN print TCP 55559",
+                 "DataBridge LAN print UDP 55557"):
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            subprocess.run(
+                'netsh advfirewall firewall delete rule name="%s"' % name,
+                capture_output=True, text=True, timeout=30)
         except Exception:
             pass
-    if all(_fw_rule_exists(_fw_rule_name(p, n)) for p, n in rules):
-        say("      OK")
-        return True, ""
-    # A non-admin install cannot add rules — retry once with a UAC prompt.
-    bat = os.path.join(tempfile.gettempdir(), "databridge-firewall.bat")
-    try:
-        with open(bat, "w", encoding="utf-8") as f:
-            f.write("@echo off\r\n")
-            for cmd in cmds:
-                f.write(cmd + " >nul 2>&1\r\n")
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Start-Process -FilePath '%s' -Verb RunAs -Wait -WindowStyle Hidden"
-             % bat],
-            capture_output=True, text=True, timeout=180)
-    except Exception:
-        pass
-    try:
-        os.unlink(bat)
-    except Exception:
-        pass
-    if all(_fw_rule_exists(_fw_rule_name(p, n)) for p, n in rules):
-        say("      OK (elevated)")
-        return True, ""
-    say("      ! skipped — LAN print may be blocked. Allow inbound "
-        "TCP 55559 / UDP 55557 in Windows Firewall.")
-    return False, "firewall"
 
 
 def main(argv):
@@ -376,6 +355,7 @@ def main(argv):
         return 1
     com_port, _how = detect_com(com_override)
     ids = detect_ids(extra_id)
+    stop_existing_hosts()
     ok, err = install_files(com_port)
     if not ok:
         say("ERROR: " + err)
@@ -387,9 +367,7 @@ def main(argv):
     ok, err = install_autostart()
     if not ok:
         say("WARNING: " + err)
-    ok, err = add_firewall_rules()
-    if not ok:
-        say("WARNING: " + err)
+    remove_legacy_firewall_rules()
     ok, err = selftest()
     if not ok:
         say("ERROR: " + err)
@@ -397,8 +375,8 @@ def main(argv):
     say()
     say("INSTALL DONE — reload the extension once, then print. "
         "No COM port or ID typing needed.")
-    say("LAN print: this PC keeps sharing its printer after Chrome closes "
-        "(autostart). Other PCs print through it on the same office network.")
+    say("Background print service installed: printing keeps working after "
+        "Chrome/Edge closes. Everything stays on this PC (no network server).")
     return 0
 
 

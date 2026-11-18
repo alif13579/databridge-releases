@@ -22,11 +22,9 @@ is side-effect free.
 Label: site default 75x102mm (600x816 dots) for the local agent; the built-in
 print_label template remains 48x80mm TSPL.
 
-LAN relay: the printer may be connected to only one laptop. Each host
-advertises itself over UDP (db-print-config.json: relay_key, node_name,
-relay_port, relay_discovery_port); a laptop without a connected printer sends
-the rendered TSPL bytes (HMAC-signed) to a peer that has one. Run the host with
---serve for an autostart coordinator that survives Chrome closing.
+Run the host with --serve to keep the local print service (55555/55556)
+alive in the background even when Chrome/Edge is closed. All printing is
+local to one machine; nothing is exposed to the network.
 """
 import sys
 import os
@@ -43,11 +41,8 @@ import tempfile
 import shutil
 import http.server
 import urllib.parse
-import urllib.error
 import urllib.request
-import hashlib
-import hmac
-import uuid
+import urllib.error
 
 
 def load_config():
@@ -83,14 +78,6 @@ def save_config(patch):
         os.replace(tmp, path)
         global CONFIG
         CONFIG = d
-        try:
-            _RELAY_KEY_CACHE.update({"key": "", "fp": ""})
-        except Exception:
-            pass
-        try:
-            _apply_relay_config(d)
-        except Exception:
-            pass
         try:
             _CONFIG_MTIME["ts"] = os.path.getmtime(path)
         except Exception:
@@ -537,15 +524,17 @@ def _cable_rank_map():
 
 
 def _cable_rank(dev):
-    ranks = _cable_rank_map()
-    if dev in ranks:
-        return ranks[dev]
+    # A live Windows spooler queue is the strongest cable signal: prefer it
+    # over raw COM ports, which can open successfully while printing nowhere.
     if os.name == "nt":
         try:
             if dev in _win_usb_printer_map():
-                return 2
+                return 3
         except Exception:  # noqa: BLE001
             pass
+    ranks = _cable_rank_map()
+    if dev in ranks:
+        return ranks[dev]
     return 2 if os.name != "nt" else 1
 
 
@@ -676,10 +665,10 @@ def _win_raw_print(queue, data):
                           % ctypes.get_last_error())
         page = False
         try:
-            if not winspool.StartPagePrinter(h):
-                raise OSError("StartPagePrinter failed (%d)"
-                              % ctypes.get_last_error())
-            page = True
+            # RAW jobs do not require page brackets, and some drivers reject
+            # StartPagePrinter. Treat them as best effort instead of failing
+            # the whole print.
+            page = bool(winspool.StartPagePrinter(h))
             buf = ctypes.create_string_buffer(bytes(data), len(data))
             written = wintypes.DWORD(0)
             if not winspool.WritePrinter(h, buf, len(data), ctypes.byref(written)):
@@ -704,7 +693,7 @@ def printer_name(dev):
 
     Tries the paired Bluetooth name, then the Windows COM description, then
     a cleaned-up device basename. Never raises, always returns a short string.
-    Cached 60s so the 5s beacon loop never re-runs system_profiler.
+    Cached 60s so repeated status calls never re-run system_profiler.
     """
     dev = str(dev or "")
     if not dev:
@@ -1244,7 +1233,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 10
+HOST_VERSION = 11
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -2241,7 +2230,7 @@ def _do_print(p, _meta=None):
     try:
         import serial
     except ImportError:
-        return {"ok": False, "error": "pyserial missing on this Mac (pip install pyserial)"}
+        return {"ok": False, "error": "pyserial missing (pip install pyserial)"}
     if p.get("_tspl") is not None:
         tspl = bytes(p.get("_tspl") or b"")
         if not tspl:
@@ -2253,27 +2242,15 @@ def _do_print(p, _meta=None):
         tspl = apply_offset(build_tspl(p), ox, oy)
     if _meta is not None:
         _meta["tspl"] = tspl
-    no_relay = bool(p.get("_no_relay"))
-    # One print coordinator per laptop: if this process does not own the LAN
-    # relay service, hand the finished bytes to the local coordinator (the
-    # autostart --serve instance). It owns the serial port and decides
-    # local-vs-relay, so two host processes never fight over the printer.
-    if RELAY_ENABLED and not no_relay and not _RELAY_SERVER_BOUND:
-        # Another local host owns the LAN relay. Send every print through it
-        # so only one process ever opens the serial port; if none answers,
-        # fall through to the local printer.
+    # One serial-port owner per laptop: if this process does not own the
+    # local bridge (the autostart --serve instance does), hand the finished
+    # bytes to it so two host processes never fight over the printer.
+    if not _LOCAL_BRIDGE_BOUND:
         via = _forward_to_coordinator(tspl)
         if via is not None:
             return via
-    if RELAY_ENABLED and RELAY_ONLY and not no_relay:
-        # This laptop is a client by config: ignore any local/false COM port
-        # and always send the bytes to the laptop that has the printer.
-        return relay_to_peer(tspl, consignment=p.get("consignment"))
-    # One local coordinator per machine. A paired printer can look unreachable
-    # for a moment while the Bluetooth link wakes, so local attempts below
-    # still include the full candidate list. If every local candidate fails,
-    # the tail of this function relays the exact bytes to a peer that has the
-    # printer.
+    # A paired printer can look unreachable for a moment while the Bluetooth
+    # link wakes, so try the full candidate list before reporting failure.
     # Connection choice — `prefer` (payload or config, default "auto"):
     #   auto  -> the CONNECTED (preferred) device first, then Bluetooth,
     #            then cable. Bluetooth-first: the extension acts as the
@@ -2316,8 +2293,7 @@ def _do_print(p, _meta=None):
         if os.name == "nt":
             # Drop Bluetooth COM ports Windows positively reports as
             # disconnected: the node stays listed while the printer sleeps and
-            # a write to it "succeeds" without printing anywhere (which would
-            # also stop this laptop from relaying to the real station).
+            # a write to it "succeeds" without printing anywhere.
             filtered = []
             for d, c in disc:
                 if c == "bluetooth":
@@ -2346,19 +2322,28 @@ def _do_print(p, _meta=None):
         return {"ok": False, "error": "no %s printer found (pair the TL5X / check connection)" % pref}
     last = None
     tried = []
+    errors = []
     for dev, conn in cands:
         if os.name == "nt":
             try:
                 umap = _win_usb_printer_map()
             except Exception:  # noqa: BLE001
                 umap = {}
-            if dev in umap:
+            is_queue = dev in umap
+            if not is_queue and not re.match(r"^(\\\\\.\\)?COM\d+$",
+                                              str(dev), re.I):
+                # A saved spooler queue name (no COM prefix) still prints
+                # through the spooler even if the 3s discovery cache missed
+                # it. A real failure below is reported, never hidden.
+                is_queue = True
+            if is_queue:
                 try:
                     _win_raw_print(dev, tspl)
                     return {"ok": True, "device": dev, "conn": "cable",
-                            "bytes": len(tspl), "port": umap[dev]}
+                            "bytes": len(tspl), "port": umap.get(dev, "")}
                 except Exception as e:  # noqa: BLE001
                     last = "%s: %s" % (dev, e)
+                    errors.append(last)
                 tried.append(dev)
                 continue
         st = warm_try(tspl, dev)  # covers the explicit-device case too
@@ -2389,15 +2374,10 @@ def _do_print(p, _meta=None):
                         "bytes": len(tspl), "conn": conn}
             except Exception as e:  # noqa: BLE001 - try next candidate
                 last = "%s @%s: %s" % (dev, baud, e)
+                errors.append(last)
         tried.append(dev)
-    if RELAY_ENABLED and not no_relay:
-        rr = relay_to_peer(tspl, prefer=CONFIG.get("relay_station"),
-                           consignment=p.get("consignment"))
-        if rr.get("ok"):
-            return rr
-        if rr.get("error"):
-            last = "%s | LAN relay: %s" % (last, rr.get("error"))
-    return {"ok": False, "error": "no printer worked (tried %s): %s" % (tried, last)}
+    detail = "; ".join(errors[-6:]) if errors else (last or "no candidate answered")
+    return {"ok": False, "error": "no printer worked (tried %s): %s" % (tried, detail)}
 
 
 def do_print(p):
@@ -2406,6 +2386,7 @@ def do_print(p):
     Also records one ledger entry per job (origin node, consignment, printer,
     result, timing) and exposes the in-flight job via _CURRENT_JOB.
     """
+    _maybe_reload_config()
     global _JOB_SEQ, _CURRENT_JOB
     with _JOBS_LOCK:
         _JOB_SEQ += 1
@@ -2413,13 +2394,12 @@ def do_print(p):
         job = {
             "id": "j%d-%d" % (int(started), _JOB_SEQ),
             "ts": round(started, 1),
-            "origin": str(p.get("_origin") or NODE_NAME)[:40],
+            "origin": NODE_NAME,
             "node": NODE_NAME,
             "consignment": str(p.get("consignment") or p.get("_consignment") or "")[:40],
             "device": str(p.get("device") or CONFIG.get("preferred") or DEVICE_DEFAULT)[:80],
             "device_name": "",
             "via": "local",
-            "relayed_to": "",
             "ok": False, "bytes": 0, "ms": 0, "error": "",
         }
     meta = {}
@@ -2452,8 +2432,7 @@ def do_print(p):
     except Exception:
         pass
     try:
-        if (res.get("ok") and not res.get("relay")
-                and not res.get("via_local_service")):
+        if res.get("ok") and not res.get("via_local_service"):
             _CONN_CACHE.update(ts=time.time(), ok=True, why="printed")
         elif not res.get("ok"):
             _CONN_CACHE.update(ts=time.time(), ok=False,
@@ -2468,20 +2447,14 @@ def do_print(p):
             job["ms"] = int((time.time() - started) * 1000)
             job["error"] = str(res.get("error") or "")[:160]
             job["device_name"] = printer_name(res.get("device") or job["device"])
-            if res.get("relay"):
-                job["via"] = "lan-client"      # this laptop forwarded to a peer
-            elif p.get("_origin"):
-                job["via"] = "lan-server"      # a peer sent this job here
-            elif res.get("via_local_service"):
+            if res.get("via_local_service"):
                 job["via"] = "local-service"
-            if res.get("relayed_to"):
-                job["relayed_to"] = str(res["relayed_to"])[:40]
             _JOBS.insert(0, job)
             del _JOBS[100:]
     except Exception:
         pass
     try:
-        relay_log("job %s %s %s cons=%s via=%s %dms %s"
+        host_log("job %s %s %s cons=%s via=%s %dms %s"
                   % (job["id"], "OK" if job["ok"] else "FAIL",
                      job["origin"], job["consignment"] or "-", job["via"],
                      job["ms"], job["error"]))
@@ -2517,84 +2490,15 @@ def probe_device(dev):
     return False, "unreachable (%s): %s" % (dev, last)
 
 
-# ── LAN print relay ───────────────────────────────────────────────────────────
-# The printer can be paired/connected to one laptop at a time. Every host
-# advertises itself over UDP; a laptop without the printer relays the finished
-# TSPL bytes (signed with a shared key) to a laptop that has it connected.
-# The relay server also acts as the single local print coordinator, so the
-# Chrome-spawned host and the autostart --serve host never fight over serial.
-def _relay_port(v, default):
-    try:
-        n = int(v)
-        return n if 1024 <= n <= 65535 else default
-    except (TypeError, ValueError):
-        return default
-
-
-RELAY_ENABLED = str(CONFIG.get("relay_enabled", True)).strip().lower() not in (
-    "0", "false", "off", "no")
-RELAY_ONLY = str(CONFIG.get("relay_only", False)).strip().lower() not in (
-    "0", "false", "off", "no", "")
-RELAY_TCP_PORT = _relay_port(CONFIG.get("relay_port"), 55559)
-RELAY_UDP_PORT = _relay_port(CONFIG.get("relay_discovery_port"), 55557)
-RELAY_BEACON_SECS = 5.0
-RELAY_PEER_TTL = 20.0
-RELAY_TIMEOUT = 45
-RELAY_KEY_DEFAULT = "dbprint-lan-v1"
-RELAY_STATION = str(CONFIG.get("relay_station") or "").strip()
-
-
-# ── Automatic LAN identity (no manual naming needed) ─────────────────────
-# Every laptop gets a stable, human-friendly, collision-free name derived
-# from its hostname + a short machine tag (MAC). Users may still override
-# it in Settings; an empty node_name means "keep it automatic".
-_GENERIC_HOSTNAMES = {"localhost", "macbook", "macbookpro", "macbook-pro",
-                      "desktop", "laptop", "pc", "computer", "databridge",
-                      "windows", "user"}
-
-
-def _machine_tag():
-    """Stable 4-char tag from the machine's MAC/uuid node — same every run."""
-    try:
-        node = uuid.getnode()
-        if node and not (node >> 40) & 1:  # ignore random multicast MACs
-            return hashlib.sha256(str(node).encode("utf-8")).hexdigest()[:4].upper()
-    except Exception:
-        pass
-    return hashlib.sha256((socket.gethostname() or "databridge")
-                          .encode("utf-8")).hexdigest()[:4].upper()
-
-
-def auto_node_name():
-    """Unique default laptop name — hostname + tag, e.g. ALIFS-MBP-A1B2."""
-    h = str(socket.gethostname() or "").strip().split(".")[0]
-    h = re.sub(r"[^A-Za-z0-9_-]+", "-", h).strip("-") or "Laptop"
-    base = h[:30].upper()
-    # Always add the tag: cloned/duplicate hostnames are common in offices
-    # and peers are keyed by node name, so two "MacBook-Pro" would collide.
-    return ("%s-%s" % (base, _machine_tag()))[:40]
-
-
-def resolve_node_name(configured=""):
-    """Configured name wins; empty means use the automatic one."""
-    name = str(configured or "").strip()
-    return (name or auto_node_name())[:40]
-
-
-NODE_NAME = resolve_node_name(CONFIG.get("node_name"))
-RELAY_SHARE = True
-RELAY_USE = True
-RELAY_BLOCK = []
-RELAY_SCOPE = ""
-RELAY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "db-print-relay.log")
-RELAY_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "db-print-relay.lock")
-_RELAY_LOCK_FILE = None
-_RELAY_SERVER_BOUND = False
-_RELAY_PEERS = {}
-_RELAY_PEERS_LOCK = threading.Lock()
-_RELAY_KEY_CACHE = {"key": "", "fp": ""}
+# ── Local identity + diagnostics log ─────────────────────────────────────
+NODE_NAME = (str(socket.gethostname() or "").strip() or "this-laptop")[:40]
+HOST_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "db-print-host.log")
+LOCAL_BRIDGE_PORT = 55559  # loopback only: one serial-port owner per machine
+_LOCAL_BRIDGE_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "db-print-host.lock")
+_LOCAL_LOCK_FILE = None
+_LOCAL_BRIDGE_BOUND = False
 _CONN_CACHE = {"ts": 0.0, "ok": False, "why": "", "dev": "", "conn": ""}
 _HTTP_FAIL_TS = {"ts": 0.0}
 _CONFIG_MTIME = {"ts": 0.0}
@@ -2602,58 +2506,19 @@ _CONFIG_MTIME = {"ts": 0.0}
 # ── Print job ledger (who printed what, and the in-flight job) ────────────
 # Bounded in-memory ring; the autostart --serve host keeps the last 100 jobs
 # for the extension's Print activity panel. Each job is also appended to the
-# relay log so a restart never loses the audit trail.
+# host log so a restart never loses the audit trail.
 _JOBS_LOCK = threading.Lock()
 _JOBS = []              # newest first, max 100
 _JOB_SEQ = 0
 _CURRENT_JOB = None
 
 
-def _bool_cfg(v, default=True):
-    s = str(v).strip().lower()
-    if s == "":
-        return bool(default)
-    return s not in ("0", "false", "off", "no")
-
-
-def _relay_block_list(v):
-    """Node names the user switched OFF in this extension window."""
-    if isinstance(v, str):
-        items = v.replace(";", ",").split(",")
-    elif isinstance(v, (list, tuple)):
-        items = list(v)
-    else:
-        items = []
-    out = []
-    for x in items:
-        s = str(x or "").strip()[:40]
-        if s and s not in out:
-            out.append(s)
-    return out[:50]
-
-
-def _apply_relay_config(d=None):
-    """Re-read the LAN keys into globals (also used by the live coordinator)."""
-    global RELAY_ENABLED, RELAY_ONLY, RELAY_SHARE, RELAY_USE
-    global RELAY_BLOCK, RELAY_SCOPE, RELAY_STATION, NODE_NAME
-    if not isinstance(d, dict):
-        d = CONFIG
-    RELAY_ENABLED = _bool_cfg(d.get("relay_enabled", True), True)
-    RELAY_ONLY = _bool_cfg(d.get("relay_only", False), False)
-    RELAY_SHARE = RELAY_ENABLED and _bool_cfg(d.get("relay_share", True), True)
-    RELAY_USE = RELAY_ENABLED and _bool_cfg(d.get("relay_use", True), True)
-    RELAY_BLOCK = _relay_block_list(d.get("relay_block"))
-    RELAY_SCOPE = str(d.get("relay_scope") or "").strip()[:40]
-    RELAY_STATION = str(d.get("relay_station") or "").strip()[:40]
-    NODE_NAME = resolve_node_name(d.get("node_name"))
-
-
 def _maybe_reload_config():
-    """Pick up toggles saved by another host process (Chrome ⇄ coordinator).
+    """Pick up config saved by another host process (Chrome ⇄ autostart).
 
-    The autostart --serve process owns the relay and printer, while the
-    extension's Settings toggle is saved by the Chrome-spawned host. A cheap
-    mtime check keeps both in sync without restarting the service.
+    The --serve process owns the serial port, while Settings values are
+    saved by the Chrome-spawned host. A cheap mtime check keeps both in
+    sync without restarting the service.
     """
     global CONFIG
     try:
@@ -2665,41 +2530,37 @@ def _maybe_reload_config():
         d = load_config()
         if isinstance(d, dict):
             CONFIG = d
-            _apply_relay_config(d)
-            _RELAY_KEY_CACHE.update({"key": "", "fp": ""})
             _CONFIG_MTIME["ts"] = m
     except Exception:
         pass
 
 
-_apply_relay_config(CONFIG)
 
-
-def relay_log(msg):
-    """Relay diagnostics - stderr is not visible in hidden/autostart runs."""
+def host_log(msg):
+    """Host diagnostics - stderr is not visible in hidden/autostart runs."""
     try:
-        if os.path.exists(RELAY_LOG_PATH) and os.path.getsize(RELAY_LOG_PATH) > 1000000:
+        if os.path.exists(HOST_LOG_PATH) and os.path.getsize(HOST_LOG_PATH) > 1000000:
             try:
-                os.replace(RELAY_LOG_PATH, RELAY_LOG_PATH + ".1")
+                os.replace(HOST_LOG_PATH, HOST_LOG_PATH + ".1")
             except Exception:
                 pass
-        with open(RELAY_LOG_PATH, "a", encoding="utf-8") as f:
+        with open(HOST_LOG_PATH, "a", encoding="utf-8") as f:
             f.write("%s pid=%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
                                         os.getpid(), msg))
     except Exception:
         pass
 
 
-def _try_coordinator_lock():
-    """Only one local host may serve the LAN relay. A per-user file lock
-    (released by the OS if the process dies) keeps the Chrome-spawned host
-    and the --serve autostart host from both listening on 55559."""
-    global _RELAY_LOCK_FILE
-    if _RELAY_LOCK_FILE is not None:
+def _try_bridge_lock():
+    """Only one local host may own the printer serial port. A per-user file
+    lock (released by the OS if the process dies) keeps the Chrome-spawned
+    host and the --serve autostart host from both holding it open."""
+    global _LOCAL_LOCK_FILE
+    if _LOCAL_LOCK_FILE is not None:
         return True
     f = None
     try:
-        f = open(RELAY_LOCK_PATH, "a+")
+        f = open(_LOCAL_BRIDGE_LOCK_PATH, "a+")
         if os.name == "nt":
             import msvcrt
             f.seek(0, os.SEEK_END)
@@ -2711,7 +2572,7 @@ def _try_coordinator_lock():
         else:
             import fcntl
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _RELAY_LOCK_FILE = f
+        _LOCAL_LOCK_FILE = f
         return True
     except Exception:
         try:
@@ -2722,133 +2583,136 @@ def _try_coordinator_lock():
         return False
 
 
-def _release_coordinator_lock():
-    global _RELAY_LOCK_FILE
-    if _RELAY_LOCK_FILE is not None:
+def _release_bridge_lock():
+    global _LOCAL_LOCK_FILE
+    if _LOCAL_LOCK_FILE is not None:
         try:
-            _RELAY_LOCK_FILE.close()
+            _LOCAL_LOCK_FILE.close()
         except Exception:
             pass
-        _RELAY_LOCK_FILE = None
+        _LOCAL_LOCK_FILE = None
 
 
-def relay_key():
-    if not _RELAY_KEY_CACHE.get("key"):
-        k = str(CONFIG.get("relay_key") or RELAY_KEY_DEFAULT)
-        _RELAY_KEY_CACHE["key"] = k
-        _RELAY_KEY_CACHE["fp"] = hashlib.sha256(k.encode("utf-8")).hexdigest()[:12]
-    return _RELAY_KEY_CACHE["key"]
-
-
-def relay_key_fp():
-    relay_key()
-    return _RELAY_KEY_CACHE.get("fp") or ""
-
-
-def _relay_sign(node, ts, body):
-    digest = hashlib.sha256(body).hexdigest()
-    msg = ("%s\n%s\n%s" % (node, ts, digest)).encode("utf-8")
-    return hmac.new(relay_key().encode("utf-8"), msg, hashlib.sha256).hexdigest()
-
-
-def _verify_relay(node, ts, sig, body):
-    if not node or not ts or not sig:
-        return False
+def _forward_to_coordinator(tspl):
+    """Send bytes to the local bridge (loopback). None = none running."""
     try:
-        if abs(time.time() - int(ts)) > 300:
-            return False
-    except (TypeError, ValueError):
-        return False
-    return hmac.compare_digest(_relay_sign(node, ts, body), str(sig))
-
-
-def _primary_ip():
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/local_print" % LOCAL_BRIDGE_PORT,
+            data=tspl, method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     "X-DB-Local": "1"})
+    except Exception:
+        return None
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read(200000)
+        res = json.loads(data.decode("utf-8"))
+        return res if isinstance(res, dict) else None
+    except urllib.error.HTTPError as e:
         try:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        finally:
-            s.close()
+            res = json.loads(e.read(200000).decode("utf-8"))
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+        return {"ok": False, "error": "local print service error: %s" % e}
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return {"ok": False, "error": "local print service timeout"}
+        return None  # nothing listening on the bridge port
     except Exception:
-        return ""
+        return None
 
 
-def _local_ipv4s():
-    ips = []
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip and not ip.startswith("127.") and not ip.startswith("169.254.") \
-                    and ip not in ips:
-                ips.append(ip)
-    except Exception:
-        pass
-    p = _primary_ip()
-    if p and not p.startswith("127.") and p not in ips:
-        ips.insert(0, p)
-    return ips
+class _LocalBridgeHandler(http.server.BaseHTTPRequestHandler):
+    """Loopback-only print gateway owned by the autostart --serve host."""
 
+    server_version = "DataBridgeLocal/1.0"
 
-def _broadcast_targets():
-    # Send on every local /24 broadcast: the default route is often a
-    # virtual/Ethernet adapter, and a Wi-Fi only broadcast would never reach
-    # the other laptop. The receiving side also unicasts a reply.
-    out = ["255.255.255.255"]
-    for ip in _local_ipv4s():
-        sub = ".".join(ip.split(".")[:3]) + ".255"
-        if sub not in out:
-            out.append(sub)
-    return out
+    def log_message(self, fmt, *args):
+        pass  # stdout/stderr are not visible in hidden runs
 
-
-def _local_candidates(p):
-    # A pinned printer port is authoritative: if THAT port is not reachable,
-    # the printer is on another laptop - never fall through to unrelated
-    # Bluetooth COM ports (they open fine but print nowhere).
-    if p.get("device"):
-        return [str(p.get("device"))]
-    if CONFIG.get("device"):
-        return [str(CONFIG.get("device"))]
-    if CONFIG.get("preferred"):
-        return [str(CONFIG.get("preferred"))]
-    if CONFIG.get("bluetooth"):
-        return [str(CONFIG.get("bluetooth"))]
-    out = []
-    try:
-        for dev, _c in discover_printers():
-            if dev not in out:
-                out.append(dev)
-    except Exception:
-        pass
-    if DEVICE_DEFAULT not in out:
-        out.append(DEVICE_DEFAULT)
-    return [d for d in out if d]
-
-
-def _local_ready(p):
-    """(connected, reason) for this laptop's own printer, with a short cache."""
-    wdev = _WARM.get("dev")
-    if _WARM.get("ser") is not None and wdev:
-        want = p.get("device") or CONFIG.get("device") or CONFIG.get("preferred")
-        if not want or want == wdev:
-            return True, "warm"
-    now = time.time()
-    cts = float(_CONN_CACHE.get("ts") or 0.0)
-    if _CONN_CACHE.get("ok") and now - cts < 60.0:
-        return True, _CONN_CACHE.get("why") or "cached"
-    if not _CONN_CACHE.get("ok") and now - cts < 5.0:
-        return False, _CONN_CACHE.get("why") or "not connected"
-    why = "not connected"
-    for dev in _local_candidates(p):
+    def _json(self, code, obj):
         try:
-            ok, why = device_connected(dev)
+            data = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/health", "/ping"):
+            self._json(200, {"ok": True, "host": "db-print",
+                             "version": HOST_VERSION,
+                             "connected": bool(_CONN_CACHE.get("ok")),
+                             "device": _CONN_CACHE.get("dev") or ""})
+        else:
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/local_print":
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            if self.client_address[0] not in ("127.0.0.1", "::1") \
+                    or self.headers.get("X-DB-Local") != "1":
+                self._json(403, {"ok": False, "error": "local prints only"})
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > 1000000:
+                self._json(400, {"ok": False, "error": "bad content length"})
+                return
+            body = self.rfile.read(n)
+            res = dict(do_print({"_tspl": body}))
+            res["via_local_service"] = True
+            self._json(200 if res.get("ok") else 500, res)
         except Exception as e:  # noqa: BLE001
-            ok, why = False, str(e)
-        if ok:
-            _CONN_CACHE.update(ts=time.time(), ok=True, why=str(why))
-            return True, str(why)
-    _CONN_CACHE.update(ts=time.time(), ok=False, why=str(why))
-    return False, str(why)
+            self._json(500, {"ok": False, "error": str(e)})
+
+
+def _start_local_bridge():
+    """Bind the loopback print gateway once per machine."""
+    global _LOCAL_BRIDGE_BOUND
+    if _LOCAL_BRIDGE_BOUND:
+        return True
+    if not _try_bridge_lock():
+        return False
+    try:
+        class _BridgeServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = os.name != "nt"
+        srv = _BridgeServer(("127.0.0.1", LOCAL_BRIDGE_PORT),
+                            _LocalBridgeHandler)
+    except Exception as e:  # noqa: BLE001
+        host_log("local bridge bind failed on 127.0.0.1:%d: %s"
+                 % (LOCAL_BRIDGE_PORT, e))
+        _release_bridge_lock()
+        return False
+    threading.Thread(target=srv.serve_forever, name="db-print-local-bridge",
+                     daemon=True).start()
+    _LOCAL_BRIDGE_BOUND = True
+    host_log("local bridge listening on 127.0.0.1:%d" % LOCAL_BRIDGE_PORT)
+    return True
+
+
+def _bridge_watch():
+    """Retake the local printer if the other host exits, and restore the
+    label service if it was not bound at startup."""
+    while True:
+        time.sleep(20)
+        try:
+            if not _LOCAL_BRIDGE_BOUND:
+                _start_local_bridge()
+            if not _HTTP_STARTED:
+                _start_label_service()
+        except Exception:
+            pass
 
 
 def _pref_mode():
@@ -2958,479 +2822,19 @@ def _conn_cache_refresh(force=False):
     return _CONN_CACHE
 
 
-def _peer_list():
-    now = time.time()
-    out = []
-    with _RELAY_PEERS_LOCK:
-        for node, p in list(_RELAY_PEERS.items()):
-            if now - float(p.get("last_seen") or 0.0) > RELAY_PEER_TTL:
-                _RELAY_PEERS.pop(node, None)
-                continue
-            if not p.get("port"):
-                continue
-            if p.get("share") is False:
-                continue  # that laptop switched LAN sharing off
-            if RELAY_SCOPE and str(p.get("scope") or "") != RELAY_SCOPE:
-                continue  # different office/team scope
-            if str(p.get("node") or "") in RELAY_BLOCK:
-                continue  # user blocked this station
-            # A probe can miss a sleeping-but-paired printer, so keep peers
-            # that merely have a printer configured ("pinned") as fallbacks.
-            if p.get("connected") or p.get("warm") or p.get("pinned"):
-                out.append(dict(p))
-
-    def rank(x):
-        return (
-            0 if (RELAY_STATION and x.get("node") == RELAY_STATION) else 1,
-            0 if x.get("warm") else 1,
-            0 if x.get("connected") else 1,
-            0 if x.get("pinned") else 1,
-            -float(x.get("last_seen") or 0.0),
-        )
-    out.sort(key=rank)
-    return out
-
-
-def _relay_public():
-    """Everything the extension's LAN print panel needs to render/save.
-
-    Shows every live LAN peer (even a laptop with no printer), so the user can
-    answer "who is on the network". Relay routing still uses _peer_list(),
-    which keeps only peers that can actually print.
-    """
-    peers = []
-    now = time.time()
-    with _RELAY_PEERS_LOCK:
-        raw = [dict(p) for p in list(_RELAY_PEERS.values())
-               if now - float(p.get("last_seen") or 0.0) <= RELAY_PEER_TTL]
-    for p in raw:
-        if str(p.get("node") or "") in RELAY_BLOCK:
-            continue  # shown in the blocked section of the panel
-        if RELAY_SCOPE and str(p.get("scope") or "") != RELAY_SCOPE:
-            continue
-        peers.append({
-            "node": p.get("node"),
-            "device": p.get("device") or "",
-            "device_name": str(p.get("device_name") or "")[:60]
-                           or printer_name(p.get("device")),
-            "addr": p.get("addr") or "",
-            "port": p.get("port"),
-            "connected": bool(p.get("connected")),
-            "warm": bool(p.get("warm")),
-            "pinned": bool(p.get("pinned")),
-            "share": p.get("share") is not False,
-            "can_print": bool(p.get("connected") or p.get("warm") or p.get("pinned")),
-            "scope": p.get("scope") or "",
-            "why": p.get("why") or "",
-            "version": p.get("version") or 0,
-            "age": round(now - float(p.get("last_seen") or 0.0), 1),
-        })
-    peers.sort(key=lambda x: (not x.get("can_print"), not x.get("connected")))
-    return {
-        "enabled": bool(RELAY_ENABLED),
-        "share": bool(RELAY_SHARE),
-        "use": bool(RELAY_USE),
-        "only": bool(RELAY_ONLY),
-        "node": NODE_NAME,
-        "node_auto": not bool(str(CONFIG.get("node_name") or "").strip()),
-        "auto_name": auto_node_name(),
-        "station_auto": not bool(RELAY_STATION),
-        "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
-        "device_name": printer_name(CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT),
-        "key_fp": relay_key_fp(),
-        "key_is_default": relay_key() == RELAY_KEY_DEFAULT,
-        "station": RELAY_STATION,
-        "scope": RELAY_SCOPE,
-        "block": list(RELAY_BLOCK),
-        "tcp_port": RELAY_TCP_PORT,
-        "udp_port": RELAY_UDP_PORT,
-        "serve": bool(_RELAY_SERVER_BOUND),
-        "peers": peers,
-    }
-
-
-def relay_status():
-    _maybe_reload_config()
-    if not _RELAY_SERVER_BOUND:
-        try:
-            with urllib.request.urlopen(
-                    "http://127.0.0.1:%d/relay_status" % RELAY_TCP_PORT,
-                    timeout=1.5) as r:
-                remote = json.loads(r.read(200000).decode("utf-8"))
-            if isinstance(remote, dict):
-                remote["via_local_service"] = True
-                return remote
-        except Exception:
-            pass
-    out = _relay_public()
-    out["local_connected"] = bool(_CONN_CACHE.get("ok"))
-    out["local_reason"] = _CONN_CACHE.get("why") or ""
-    out["local_device"] = _CONN_CACHE.get("dev") or ""
-    out["local_conn"] = _CONN_CACHE.get("conn") or ""
-    return out
-
-
-def set_relay_config(msg):
-    """Save the LAN print panel's toggles/key into db-print-config.json."""
-    patch = {}
-    for key in ("relay_enabled", "relay_share", "relay_use", "relay_only"):
-        if msg.get(key) is not None:
-            patch[key] = _bool_cfg(msg.get(key), True)
-    for key, limit in (("node_name", 40), ("relay_station", 40),
-                       ("relay_scope", 40)):
-        if msg.get(key) is not None:
-            patch[key] = str(msg.get(key) or "").strip()[:limit]
-    if msg.get("relay_key") is not None:
-        patch["relay_key"] = str(msg.get("relay_key") or "").strip()[:128]
-    if msg.get("relay_block") is not None:
-        patch["relay_block"] = _relay_block_list(msg.get("relay_block"))
-    ok, err = save_config(patch)
-    if not ok:
-        return {"ok": False, "error": "config save failed: " + err}
-    out = _relay_public()
-    out["ok"] = True
-    return out
-
-
-def _forward_to_coordinator(tspl):
-    """Send bytes to the local coordinator (loopback). None = none running."""
-    try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:%d/local_print" % RELAY_TCP_PORT,
-            data=tspl, method="POST",
-            headers={"Content-Type": "application/octet-stream",
-                     "X-DB-Local": "1"})
-    except Exception:
-        return None
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = r.read(200000)
-        res = json.loads(data.decode("utf-8"))
-        if isinstance(res, dict):
-            res["via_local_service"] = True
-        return res if isinstance(res, dict) else None
-    except urllib.error.HTTPError as e:
-        try:
-            res = json.loads(e.read(200000).decode("utf-8"))
-            if isinstance(res, dict):
-                res["via_local_service"] = True
-                return res
-        except Exception:
-            pass
-        return {"ok": False, "error": "local print service error: %s" % e,
-                "via_local_service": True}
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            return {"ok": False, "error": "local print service timeout"}
-        return None  # nothing listening on the coordinator port
-    except Exception:
-        return None
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_RELAY_OPENER = urllib.request.build_opener(_NoRedirect)
-
-
-def relay_to_peer(tspl, prefer=None, consignment=None):
-    if not RELAY_ENABLED:
-        return {"ok": False, "error": "LAN relay disabled"}
-    if not RELAY_USE:
-        return {"ok": False, "error": "LAN print use is off on this laptop"}
-    peers = _peer_list()
-    if prefer:
-        peers.sort(key=lambda x: x.get("node") != prefer)
-    if not peers:
-        return {"ok": False,
-                "error": "no LAN print station with a connected printer "
-                         "(open the printer laptop / check office WiFi)",
-                "relay_peers": 0}
-    errors = []
-    for p in peers:
-        node = str(p.get("node") or "")
-        port = int(p.get("port") or 0)
-        addr = str(p.get("addr") or "")
-        if not node or not port or not addr:
-            continue
-        ts = str(int(time.time()))
-        req = urllib.request.Request(
-            "http://%s:%d/relay_print" % (addr, port),
-            data=tspl, method="POST",
-            headers={"Content-Type": "application/octet-stream",
-                     "X-DB-Node": NODE_NAME,
-                     "X-DB-Time": ts,
-                     "X-DB-Consignment": str(consignment or "")[:40],
-                     "X-DB-Sign": _relay_sign(NODE_NAME, ts, tspl)})
-        try:
-            with _RELAY_OPENER.open(req, timeout=RELAY_TIMEOUT) as r:
-                res = json.loads(r.read(200000).decode("utf-8"))
-            if isinstance(res, dict) and res.get("ok"):
-                res = dict(res)
-                res["relay"] = True
-                res["relayed_to"] = node
-                relay_log("relayed %d bytes to %s (%s:%d)"
-                          % (len(tspl), node, addr, port))
-                return res
-            errors.append("%s: %s" % (node, (res or {}).get("error") if isinstance(res, dict) else "bad reply"))
-        except Exception as e:  # noqa: BLE001
-            errors.append("%s: %s" % (node, e))
-        with _RELAY_PEERS_LOCK:
-            cur = _RELAY_PEERS.get(node)
-            if cur:
-                cur["connected"] = False
-    return {"ok": False,
-            "error": "LAN print station failed: %s" % "; ".join(errors[:3]),
-            "relay_peers": len(peers)}
-
-
-class _RelayHTTPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DataBridgeRelay/1.0"
-
-    def log_message(self, fmt, *args):
-        pass  # stdout/stderr are not visible in hidden runs
-
-    def _json(self, code, obj):
-        try:
-            data = json.dumps(obj).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception:
-            pass
-
-    def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path in ("/relay_status", "/relay_ping", "/health", "/ping"):
-            self._json(200, relay_status())
-        else:
-            self._json(404, {"ok": False, "error": "not found"})
-
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path not in ("/relay_print", "/local_print"):
-            self._json(404, {"ok": False, "error": "not found"})
-            return
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > 1000000:
-                self._json(400, {"ok": False, "error": "bad content length"})
-                return
-            body = self.rfile.read(n)
-            if path == "/local_print":
-                if self.client_address[0] not in ("127.0.0.1", "::1") \
-                        or self.headers.get("X-DB-Local") != "1":
-                    self._json(403, {"ok": False, "error": "local prints only"})
-                    return
-                res = do_print({"_tspl": body})
-            else:
-                if not RELAY_SHARE:
-                    self._json(403, {"ok": False,
-                                     "error": "this laptop is not sharing its printer"})
-                    return
-                node = str(self.headers.get("X-DB-Node") or "")
-                ts = str(self.headers.get("X-DB-Time") or "")
-                sig = str(self.headers.get("X-DB-Sign") or "")
-                if not _verify_relay(node, ts, sig, body):
-                    self._json(403, {"ok": False, "error": "bad relay signature"})
-                    return
-                relay_log("relay job from %s: %d bytes" % (node, len(body)))
-                res = do_print({
-                    "_tspl": body, "_no_relay": True,
-                    "_origin": node,
-                    "_consignment": str(self.headers.get("X-DB-Consignment") or "")[:40],
-                })
-            res = dict(res)
-            res["node"] = NODE_NAME
-            self._json(200 if res.get("ok") else 500, res)
-        except Exception as e:  # noqa: BLE001
-            self._json(500, {"ok": False, "error": str(e)})
-
-
-def _beacon_payload():
-    return {
-        "app": "databridge-print",
-        "v": 1,
-        "node": NODE_NAME,
-        "port": RELAY_TCP_PORT,
-        "key_fp": relay_key_fp(),
-        "connected": bool(_CONN_CACHE.get("ok")),
-        "warm": bool(_WARM.get("ser")),
-        "pinned": bool(CONFIG.get("device") or CONFIG.get("preferred")
-                       or CONFIG.get("bluetooth")),
-        "why": _CONN_CACHE.get("why") or "",
-        "device": CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT,
-        "device_name": printer_name(CONFIG.get("preferred") or CONFIG.get("device") or DEVICE_DEFAULT),
-        "share": bool(RELAY_SHARE),
-        "scope": RELAY_SCOPE,
-        "version": HOST_VERSION,
-        "ts": time.time(),
-    }
-
-
-def _relay_beacon_loop():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        except Exception:
-            pass
-        sock.bind(("", RELAY_UDP_PORT))
-    except Exception as e:  # noqa: BLE001
-        relay_log("discovery bind failed on %d: %s" % (RELAY_UDP_PORT, e))
-        try:
-            sock.close()
-        except Exception:
-            pass
-        return
-    sock.settimeout(2.0)
-    _conn_cache_refresh(True)
-    last_send = 0.0
-    while True:
-        try:
-            now = time.time()
-            if now - last_send >= RELAY_BEACON_SECS:
-                _maybe_reload_config()
-                _conn_cache_refresh(False)
-                beacon = _beacon_payload()
-                data = json.dumps(beacon).encode("utf-8")
-                for target in _broadcast_targets():
-                    try:
-                        sock.sendto(data, (target, RELAY_UDP_PORT))
-                    except Exception:
-                        pass
-                last_send = now
-            try:
-                raw, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except Exception:
-                time.sleep(0.2)
-                continue
-            try:
-                m = json.loads(raw.decode("utf-8"))
-            except Exception:
-                continue
-            if not isinstance(m, dict) or m.get("app") != "databridge-print" \
-                    or m.get("v") != 1:
-                continue
-            node = str(m.get("node") or "").strip()
-            if not node or node == NODE_NAME:
-                continue
-            if str(m.get("key_fp") or "") != relay_key_fp():
-                continue
-            port = int(m.get("port") or 0)
-            if not port:
-                continue
-            if not m.get("reply"):
-                # A broadcast may leave only through the default-route NIC.
-                # Reply directly to the sender so its source IP (the NIC that
-                # can reach us) is what it stores as our relay address.
-                try:
-                    reply = _beacon_payload()
-                    reply["reply"] = True
-                    sock.sendto(json.dumps(reply).encode("utf-8"), addr)
-                except Exception:
-                    pass
-            connected = bool(m.get("connected"))
-            with _RELAY_PEERS_LOCK:
-                prev = _RELAY_PEERS.get(node)
-                _RELAY_PEERS[node] = {
-                    "node": node,
-                    "addr": addr[0],
-                    "port": port,
-                    "connected": connected,
-                    "warm": bool(m.get("warm")),
-                    "pinned": bool(m.get("pinned")),
-                    "why": m.get("why") or "",
-                    "device": m.get("device") or "",
-                    "device_name": str(m.get("device_name") or "")[:60]
-                                   or printer_name(m.get("device")),
-                    "share": m.get("share") is not False,
-                    "scope": str(m.get("scope") or ""),
-                    "version": m.get("version") or 0,
-                    "last_seen": time.time(),
-                }
-            if prev is None or bool(prev.get("connected")) != connected:
-                relay_log("peer %s %s at %s:%d (%s)"
-                          % (node, "connected" if connected else "seen",
-                             addr[0], port, m.get("why") or ""))
-        except Exception as e:  # noqa: BLE001
-            relay_log("discovery loop: %s" % e)
-            time.sleep(1.0)
-
-
-def _start_relay_service():
-    global _RELAY_SERVER_BOUND
-    if _RELAY_SERVER_BOUND:
-        return True
-    if not RELAY_ENABLED:
-        return False
-    if not _try_coordinator_lock():
-        return False
-    try:
-        class _RelayServer(http.server.ThreadingHTTPServer):
-            daemon_threads = True
-            allow_reuse_address = True
-        srv = _RelayServer(("0.0.0.0", RELAY_TCP_PORT), _RelayHTTPHandler)
-    except Exception as e:  # noqa: BLE001
-        relay_log("relay bind failed on %d: %s" % (RELAY_TCP_PORT, e))
-        _release_coordinator_lock()
-        return False
-    threading.Thread(target=srv.serve_forever, name="db-print-relay",
-                     daemon=True).start()
-    _RELAY_SERVER_BOUND = True
-    relay_log("relay listening on 0.0.0.0:%d node=%s key_fp=%s"
-              % (RELAY_TCP_PORT, NODE_NAME, relay_key_fp()))
-    try:
-        threading.Thread(target=_relay_beacon_loop, name="db-print-discovery",
-                         daemon=True).start()
-    except Exception as e:  # noqa: BLE001
-        relay_log("discovery start failed: %s" % e)
-    return True
-
-
-def _coordinator_watch():
-    """A host that started as a forwarder takes over if the coordinator
-    exits, and restores port 55555 if the other local host owned it."""
-    while True:
-        time.sleep(20)
-        try:
-            if RELAY_ENABLED and not _RELAY_SERVER_BOUND:
-                _start_relay_service()
-            if not _HTTP_STARTED:
-                _start_label_service()
-        except Exception:
-            pass
-
-
 def handle(msg):
     action = (msg.get("action") or "").strip()
     _maybe_reload_config()
     if action == "ping":
         # Never probe every COM port here: phantom Bluetooth ports take ~3s
         # per baud each, which pushed ping past the extension timeout and
-        # showed "Print host missing" while the printer was connected. Ask
-        # the local coordinator for its cached truth, else probe only the
-        # preferred/default device (cached).
-        relay = relay_status()
-        if relay.get("via_local_service"):
-            dev_ok = bool(relay.get("local_connected"))
-            dev_why = relay.get("local_reason") or ""
-            detected = str(relay.get("local_device") or "")
-            detected_conn = str(relay.get("local_conn") or "")
-        else:
-            cc = _conn_cache_refresh(False)
-            dev_ok = bool(cc.get("ok"))
-            dev_why = cc.get("why") or ""
-            detected = str(cc.get("dev") or "")
-            detected_conn = str(cc.get("conn") or "")
+        # showed "Print host missing" while the printer was connected. Use
+        # the cached connection truth instead (refreshed at most every 10s).
+        cc = _conn_cache_refresh(False)
+        dev_ok = bool(cc.get("ok"))
+        dev_why = cc.get("why") or ""
+        detected = str(cc.get("dev") or "")
+        detected_conn = str(cc.get("conn") or "")
         active = (detected if dev_ok and detected else
                   (CONFIG.get("preferred") or CONFIG.get("device")
                    or DEVICE_DEFAULT))
@@ -3456,12 +2860,7 @@ def handle(msg):
                 "offset_x_mm": CONFIG.get("offset_x_mm", 0),
                 "offset_y_mm": CONFIG.get("offset_y_mm", 0),
                 "border": bool(CONFIG.get("border", False)),
-                "relay": relay,
                 "printers": printers}
-    if action == "get_relay_config":
-        out = _relay_public()
-        out["ok"] = True
-        return out
     if action == "print_history":
         with _JOBS_LOCK:
             cur = dict(_CURRENT_JOB) if _CURRENT_JOB else None
@@ -3470,8 +2869,6 @@ def handle(msg):
         return {"ok": True, "current": cur, "history": history,
                 "counts": {"total": len(history), "ok": ok_n,
                            "failed": len(history) - ok_n}}
-    if action == "set_relay_config":
-        return set_relay_config(msg)
     if action == "driver_status":
         return driver_status()
     if action == "driver_test":
@@ -3901,7 +3298,7 @@ def _start_label_service():
                          % (LABEL_SERVICE_PORT, e))
         if time.time() - _HTTP_FAIL_TS.get("ts", 0.0) > 300:
             _HTTP_FAIL_TS["ts"] = time.time()
-            relay_log("local print service bind failed on %s: %s"
+            host_log("local print service bind failed on %s: %s"
                       % (LABEL_SERVICE_PORT, e))
     try:
         class _Server6(http.server.ThreadingHTTPServer):
@@ -3920,22 +3317,23 @@ def _start_label_service():
         t = threading.Thread(target=srv.serve_forever,
                              name="db-print-http-%d" % i, daemon=True)
         t.start()
-    relay_log("local print service listening on %s" % LABEL_SERVICE_PORT)
+    host_log("local print service listening on %s" % LABEL_SERVICE_PORT)
     return True
 
 
 def serve():
     """Standalone mode (autostart): no Chrome stdin, keep the local print
-    service + LAN relay alive for every laptop on the office network."""
-    relay_log("serve mode start node=%s version=%s" % (NODE_NAME, HOST_VERSION))
+    service and the serial-port bridge alive in the background."""
+    host_log("serve mode start version=%s" % HOST_VERSION)
     while True:
         try:
+            _maybe_reload_config()
             if not _HTTP_STARTED:
                 _start_label_service()
-            if RELAY_ENABLED and not _RELAY_SERVER_BOUND:
-                _start_relay_service()
+            if not _LOCAL_BRIDGE_BOUND:
+                _start_local_bridge()
         except Exception as e:  # noqa: BLE001 - never die
-            relay_log("serve loop: %s" % e)
+            host_log("serve loop: %s" % e)
         time.sleep(10)
 
 
@@ -3944,9 +3342,9 @@ def main():
         serve()
         return
     _start_label_service()
-    _start_relay_service()
+    _start_local_bridge()
     try:
-        threading.Thread(target=_coordinator_watch, name="db-print-coordinator",
+        threading.Thread(target=_bridge_watch, name="db-print-bridge-watch",
                          daemon=True).start()
     except Exception:
         pass
