@@ -110,6 +110,12 @@ def conn_type(dev):
     """bluetooth vs cable, for the toast ('which printer printed?').
     Explicit per-machine override wins (db-print-config.json {"conn": ...});
     otherwise guessed from the device name."""
+    if os.name == "nt":
+        try:
+            if dev in _win_usb_printer_map():
+                return "cable"
+        except Exception:  # noqa: BLE001
+            pass
     override = str(CONFIG.get("conn") or "").strip().lower()
     if override in ("bluetooth", "bt"):
         return "bluetooth"
@@ -456,6 +462,13 @@ def discover_printers():
                      # (TL5X over USB often shows up as a plain COM port whose
                      # description lacks "usb", e.g. "Serial Port (COM5)").
                      found.append((p.device, "cable"))
+             # USB printer-class models (e.g. Spirit SPRT) have no COM port;
+             # they print through the Windows spooler in RAW mode.
+             try:
+                 for qname in _win_usb_printer_map():
+                     found.append((qname, "cable"))
+             except Exception:  # noqa: BLE001
+                 pass
          else:
             import glob
             cands = sorted(glob.glob("/dev/cu.*") + glob.glob("/dev/ttyUSB*") +
@@ -527,7 +540,160 @@ def _cable_rank(dev):
     ranks = _cable_rank_map()
     if dev in ranks:
         return ranks[dev]
+    if os.name == "nt":
+        try:
+            if dev in _win_usb_printer_map():
+                return 2
+        except Exception:  # noqa: BLE001
+            pass
     return 2 if os.name != "nt" else 1
+
+
+# USB label printers that use the Windows printer class (no COM port) are
+# printed through the spooler with raw TSPL. Queue names are matched against
+# this whitelist so office laser printers are never picked.
+_USB_PRINT_GOOD = (
+    "tl5x", "sprt", "spirit", "label", "thermal", "barcode", "tspl",
+    "zebra", "xprinter", "godex", "tsc", "citizen", "argox", "postek",
+    "hprt",
+)
+_USB_PRINT_BAD = (
+    "brother", "laser", "inkjet", "deskjet", "officejet", "pdf", "onenote",
+    "fax", "xps", "canon", "epson", "hewlett", "hp ",
+)
+_USB_PRINT_CACHE = {"ts": 0.0, "map": {}}
+
+
+def _win_usb_port_present(port):
+    """True when the USB printer device behind a spooler port is plugged in."""
+    try:
+        import ctypes
+        import winreg
+        key = (r"SYSTEM\CurrentControlSet\Control\Print\Monitors"
+               r"\USB Monitor\Ports\%s" % port)
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+            devid = str(winreg.QueryValueEx(k, "Device Id")[0] or "")
+        if not devid:
+            return False
+        cfg = ctypes.WinDLL("cfgmgr32")
+        cfg.CM_Locate_DevNodeW.argtypes = [
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_wchar_p, ctypes.c_uint32]
+        cfg.CM_Locate_DevNodeW.restype = ctypes.c_uint32
+        inst = ctypes.c_uint32()
+        return cfg.CM_Locate_DevNodeW(
+            ctypes.byref(inst), devid, 0) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _win_usb_printer_map():
+    """{queue name: USB port} for present USB label printers."""
+    if os.name != "nt":
+        return {}
+    now = time.time()
+    if now - float(_USB_PRINT_CACHE.get("ts") or 0.0) < 3.0:
+        return dict(_USB_PRINT_CACHE.get("map") or {})
+    out = {}
+    try:
+        import winreg
+        root = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Print\Printers")
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            if not name or name.startswith("S-1-5-") or ":" in name:
+                continue
+            try:
+                sub = winreg.OpenKey(root, name)
+            except OSError:
+                continue
+            def val(v):
+                try:
+                    return str(winreg.QueryValueEx(sub, v)[0] or "")
+                except OSError:
+                    return ""
+            port = val("Port")
+            blob = " ".join((name, val("Printer Driver"),
+                             val("Description"))).lower()
+            if not port.upper().startswith("USB"):
+                continue
+            if any(b in blob for b in _USB_PRINT_BAD):
+                continue
+            if not any(g in blob for g in _USB_PRINT_GOOD):
+                continue
+            if not _win_usb_port_present(port):
+                continue
+            out[name] = port
+        winreg.CloseKey(root)
+    except Exception:  # noqa: BLE001
+        pass
+    _USB_PRINT_CACHE.update(ts=now, map=dict(out))
+    return out
+
+
+def _win_raw_print(queue, data):
+    """Send raw TSPL bytes to a Windows printer queue (USB printer class)."""
+    if os.name != "nt":
+        raise OSError("Windows spooler only")
+    import ctypes
+    from ctypes import wintypes
+    winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+
+    class DOC_INFO_1W(ctypes.Structure):
+        _fields_ = [
+            ("pDocName", wintypes.LPWSTR),
+            ("pOutputFile", wintypes.LPWSTR),
+            ("pDatatype", wintypes.LPWSTR),
+        ]
+
+    winspool.OpenPrinterW.argtypes = [
+        wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p]
+    winspool.OpenPrinterW.restype = wintypes.BOOL
+    winspool.StartDocPrinterW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(DOC_INFO_1W)]
+    winspool.StartDocPrinterW.restype = wintypes.DWORD
+    winspool.StartPagePrinter.argtypes = [wintypes.HANDLE]
+    winspool.StartPagePrinter.restype = wintypes.BOOL
+    winspool.WritePrinter.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    winspool.WritePrinter.restype = wintypes.BOOL
+    winspool.EndPagePrinter.argtypes = [wintypes.HANDLE]
+    winspool.EndDocPrinter.argtypes = [wintypes.HANDLE]
+    winspool.ClosePrinter.argtypes = [wintypes.HANDLE]
+    h = wintypes.HANDLE()
+    if not winspool.OpenPrinterW(str(queue), ctypes.byref(h), None):
+        raise OSError("OpenPrinter failed (%d)" % ctypes.get_last_error())
+    try:
+        di = DOC_INFO_1W("DataBridge", None, "RAW")
+        if not winspool.StartDocPrinterW(h, 1, ctypes.byref(di)):
+            raise OSError("StartDocPrinter failed (%d)"
+                          % ctypes.get_last_error())
+        page = False
+        try:
+            if not winspool.StartPagePrinter(h):
+                raise OSError("StartPagePrinter failed (%d)"
+                              % ctypes.get_last_error())
+            page = True
+            buf = ctypes.create_string_buffer(bytes(data), len(data))
+            written = wintypes.DWORD(0)
+            if not winspool.WritePrinter(h, buf, len(data), ctypes.byref(written)):
+                raise OSError("WritePrinter failed (%d)"
+                              % ctypes.get_last_error())
+            if written.value != len(data):
+                raise OSError("short write %d/%d"
+                              % (written.value, len(data)))
+        finally:
+            if page:
+                winspool.EndPagePrinter(h)
+            winspool.EndDocPrinter(h)
+    finally:
+        winspool.ClosePrinter(h)
 
 
 _PRINTER_NAME_CACHE = {}
@@ -897,6 +1063,12 @@ def device_connected(dev):
     dev = dev or DEVICE_DEFAULT
     if _WARM.get("ser") is not None and _WARM.get("dev") == dev:
         return True, "warm"
+    if os.name == "nt":
+        try:
+            if dev in _win_usb_printer_map():
+                return True, "cable"
+        except Exception:  # noqa: BLE001
+            pass
     ctype = conn_type(dev)
     if ctype == "bluetooth" and sys.platform == "darwin":
         live, paired = bt_link_lists()
@@ -1072,7 +1244,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 9
+HOST_VERSION = 10
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -2175,6 +2347,20 @@ def _do_print(p, _meta=None):
     last = None
     tried = []
     for dev, conn in cands:
+        if os.name == "nt":
+            try:
+                umap = _win_usb_printer_map()
+            except Exception:  # noqa: BLE001
+                umap = {}
+            if dev in umap:
+                try:
+                    _win_raw_print(dev, tspl)
+                    return {"ok": True, "device": dev, "conn": "cable",
+                            "bytes": len(tspl), "port": umap[dev]}
+                except Exception as e:  # noqa: BLE001
+                    last = "%s: %s" % (dev, e)
+                tried.append(dev)
+                continue
         st = warm_try(tspl, dev)  # covers the explicit-device case too
         if st:
             return st
@@ -2306,6 +2492,13 @@ def do_print(p):
 
 def probe_device(dev):
     """Open+close at each baud without printing. (True, baud) or (False, err)."""
+    if os.name == "nt":
+        try:
+            umap = _win_usb_printer_map()
+            if dev in umap:
+                return True, umap[dev]
+        except Exception:  # noqa: BLE001
+            pass
     try:
         import serial
     except ImportError:
@@ -3620,7 +3813,7 @@ def print_html_label(payload):
     except Exception as e:  # noqa: BLE001 - report to the site
         return {"ok": False, "error": "label render failed: %s" % e}
     req = {"_tspl": tspl}
-    dev = CONFIG.get("device") or CONFIG.get("preferred") or ""
+    dev = CONFIG.get("device") or ""
     if dev:
         req["device"] = dev
     return do_print(req)
