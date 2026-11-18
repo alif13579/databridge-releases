@@ -440,9 +440,9 @@ def wrap_chars_for(W, font="2", margin=12):
 
 
 def discover_printers():
-    """All candidate label printers as [(device, conn)], cable FIRST then
-    bluetooth — cable always gets priority when both are plugged in.
-    Unknown devices are skipped (never poke random hardware)."""
+    """All candidate label printers as [(device, conn)] — cable listed first.
+    Callers decide which transport to try first. Unknown devices are skipped
+    (never poke random hardware)."""
     found = []
     try:
          if os.name == "nt":
@@ -472,6 +472,62 @@ def discover_printers():
         pass
     found.sort(key=lambda x: 0 if x[1] == "cable" else 1)
     return found
+
+
+# Cable candidates are ranked by how strongly Windows describes them as a
+# USB serial bridge / printer. Rank 0 = clearly not a printer (phone, modem,
+# GPS...), rank 2 = known bridge, rank 1 = unknown plain serial port.
+_CABLE_RANK_CACHE = {"ts": 0.0, "map": {}}
+_CABLE_GOOD = (
+    "ch340", "ch341", "cp210", "ft232", "ftdi", "prolific", "pl2303",
+    "usb serial", "usb-serial", "uart", "tl5x", "sprt", "printer",
+    "receipt", "pos printer", "label",
+)
+_CABLE_BAD = (
+    "samsung", "android", "mtp", "adb", "modem", "phone", "iphone",
+    "ipad", "huawei", "xiaomi", "oppo", "vivo", "realme", "oneplus",
+    "qualcomm", "diagnostic", "gps", "wwan", "lte", "cdc acm",
+)
+_CABLE_GOOD_VIDS = (0x1A86, 0x10C4, 0x0403, 0x067B, 0x2341, 0x1FC9)
+
+
+def _cable_rank_map():
+    now = time.time()
+    if now - float(_CABLE_RANK_CACHE.get("ts") or 0.0) < 10.0:
+        return _CABLE_RANK_CACHE.get("map") or {}
+    ranks = {}
+    if os.name == "nt":
+        try:
+            from serial.tools import list_ports
+            for p in list_ports.comports():
+                desc = " ".join(str(x or "") for x in (
+                    getattr(p, "description", None),
+                    getattr(p, "manufacturer", None),
+                    getattr(p, "product", None),
+                    getattr(p, "hwid", None),
+                )).lower()
+                try:
+                    vid = int(getattr(p, "vid", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    vid = 0
+                if any(b in desc for b in _CABLE_BAD):
+                    rank = 0
+                elif any(g in desc for g in _CABLE_GOOD) or vid in _CABLE_GOOD_VIDS:
+                    rank = 2
+                else:
+                    rank = 1
+                ranks[p.device] = rank
+        except Exception:  # noqa: BLE001
+            pass
+    _CABLE_RANK_CACHE.update(ts=now, map=ranks)
+    return ranks
+
+
+def _cable_rank(dev):
+    ranks = _cable_rank_map()
+    if dev in ranks:
+        return ranks[dev]
+    return 2 if os.name != "nt" else 1
 
 
 _PRINTER_NAME_CACHE = {}
@@ -711,6 +767,9 @@ def _win_bt_name_from_mac(mac):
     return None
 
 
+_WIN_COM_NAME_CACHE = {}
+
+
 def _win_com_bt_name(dev):
     """Cached COM-port → Bluetooth device-name lookup (registry scan is cheap
     but not free; pairing changes are picked up within 30s)."""
@@ -820,6 +879,17 @@ def _win_bt_verify(dev):
     return True, False
 
 
+def _bt_known_dead(dev):
+    """True only when Windows positively knows a BT port is offline."""
+    if os.name != "nt":
+        return False
+    try:
+        known, live = _win_bt_verify(dev)
+        return bool(known and not live)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def device_connected(dev):
     """(connected, reason) — real reachability, not just a /dev node.
     reason: warm | bluetooth | cable | paired-not-connected | not-found |
@@ -842,6 +912,11 @@ def device_connected(dev):
         if known:
             return (True, "bluetooth") if live else (False, "paired-not-connected")
     if ctype == "cable":
+        if os.name == "nt":
+            # "COM8" is not a filesystem path — os.path.exists() lies on
+            # Windows. A quick open/close is the only real reachability test.
+            ok, _info = probe_device(dev)
+            return (True, "cable") if ok else (False, "not-found")
         return (True, "cable") if os.path.exists(dev) else (False, "not-found")
     if os.name == "nt":
         ok, info = probe_device(dev)
@@ -997,7 +1072,7 @@ def driver_restart():
 
 
 BAUDS = [115200, 9600]
-HOST_VERSION = 8
+HOST_VERSION = 9
 
 # ── Warm serial port ─────────────────────────────────────────────────────
 # The extension now keeps ONE host process alive for every print (persistent
@@ -2046,7 +2121,10 @@ def _do_print(p, _meta=None):
     # instant on Windows Bluetooth SPP).
     warm_dev = _WARM.get("dev")
     if warm_dev and not p.get("device") and not CONFIG.get("device"):
-        if pref == "auto" or conn_type(warm_dev) == pref:
+        wconn = conn_type(warm_dev)
+        if pref == "auto" and _bt_known_dead(warm_dev):
+            pass  # sleeping BT printer: don't stall, fall through to cable
+        elif pref == "auto" or wconn == pref:
             st = warm_try(tspl, warm_dev)
             if st:
                 return st
@@ -2059,7 +2137,8 @@ def _do_print(p, _meta=None):
         if CONFIG.get("preferred"):
             pdev = CONFIG.get("preferred")
             pconn = conn_type(pdev)
-            if pref == "auto" or pconn == pref:
+            dead_bt = pref == "auto" and _bt_known_dead(pdev)
+            if (pref == "auto" or pconn == pref) and not dead_bt:
                 cands.append((pdev, pconn))
         disc = discover_printers()
         if os.name == "nt":
@@ -2078,7 +2157,9 @@ def _do_print(p, _meta=None):
         if pref in ("auto", "bt"):
             cands += [c for c in disc if c[1] == "bluetooth"]
         if pref in ("auto", "cable"):
-            cands += [c for c in disc if c[1] == "cable"]
+            cables = [c for c in disc if c[1] == "cable" and _cable_rank(c[0]) > 0]
+            cables.sort(key=lambda c: -_cable_rank(c[0]))
+            cands += cables
         seen, uniq_cands = set(), []
         for dev, conn in cands:
             if dev not in seen:
@@ -2321,7 +2402,7 @@ _RELAY_SERVER_BOUND = False
 _RELAY_PEERS = {}
 _RELAY_PEERS_LOCK = threading.Lock()
 _RELAY_KEY_CACHE = {"key": "", "fp": ""}
-_CONN_CACHE = {"ts": 0.0, "ok": False, "why": ""}
+_CONN_CACHE = {"ts": 0.0, "ok": False, "why": "", "dev": "", "conn": ""}
 _HTTP_FAIL_TS = {"ts": 0.0}
 _CONFIG_MTIME = {"ts": 0.0}
 
@@ -2577,23 +2658,107 @@ def _local_ready(p):
     return False, str(why)
 
 
+def _pref_mode():
+    pref = str(CONFIG.get("prefer") or "auto").strip().lower()
+    if pref in ("bluetooth", "bt"):
+        return "bt"
+    if pref in ("usb", "cable"):
+        return "cable"
+    return "auto"
+
+
+def _dev_label(dev):
+    """bluetooth/cable for a device from discovery (ignores the legacy
+    config `conn` override, which can mislabel every port)."""
+    try:
+        for d, c in discover_printers():
+            if d == dev:
+                return c
+    except Exception:  # noqa: BLE001
+        pass
+    return conn_type(dev)
+
+
+def _detect_candidates():
+    """Ordered [(device, transport)] for the current prefer mode."""
+    pref = _pref_mode()
+    disc = discover_printers()
+    labels = {d: c for d, c in disc}
+    out, seen = [], set()
+
+    def add(dev, ctype):
+        if dev and dev not in seen:
+            seen.add(dev)
+            out.append((dev, ctype))
+
+    if CONFIG.get("device"):
+        dev = str(CONFIG.get("device"))
+        return [(dev, labels.get(dev) or conn_type(dev))]
+
+    for dev in (CONFIG.get("preferred"), CONFIG.get("bluetooth")):
+        if dev:
+            dev = str(dev)
+            add(dev, labels.get(dev) or conn_type(dev))
+    if pref in ("auto", "bt"):
+        for dev, ctype in disc:
+            if ctype == "bluetooth":
+                add(dev, ctype)
+    if pref in ("auto", "cable"):
+        cables = [(d, c) for d, c in disc
+                  if c == "cable" and _cable_rank(d) > 0]
+        cables.sort(key=lambda x: -_cable_rank(x[0]))
+        for dev, ctype in cables:
+            add(dev, ctype)
+    return [(d, c) for d, c in out
+            if pref == "auto"
+            or (pref == "bt" and c == "bluetooth")
+            or (pref == "cable" and c == "cable")]
+
+
+def _detect_local_printer():
+    """(ok, device, transport, reason) — the port that can actually print."""
+    first = last = "not-found"
+    for dev, ctype in _detect_candidates():
+        if ctype == "bluetooth" and os.name == "nt":
+            known, live = _win_bt_verify(dev)
+            if known:
+                if live:
+                    return True, dev, "bluetooth", "bluetooth"
+                last = "paired-not-connected"
+                if first == "not-found":
+                    first = last
+                continue
+        try:
+            ok, why = device_connected(dev)
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, str(e)
+        if ok:
+            return True, dev, ctype or _dev_label(dev), str(why)
+        last = str(why)
+        if first == "not-found":
+            first = last
+    return False, "", "", (first if first != "not-found" else last)
+
+
 def _conn_cache_refresh(force=False):
     now = time.time()
     if not force and now - float(_CONN_CACHE.get("ts") or 0.0) < 10.0:
         return _CONN_CACHE
-    if _WARM.get("ser") is not None:
-        _CONN_CACHE.update(ts=now, ok=True, why="warm")
+    if _WARM.get("ser") is not None and _WARM.get("dev"):
+        dev = str(_WARM.get("dev"))
+        _CONN_CACHE.update(ts=now, ok=True, why="warm", dev=dev,
+                           conn=_dev_label(dev))
         return _CONN_CACHE
     got = PRINT_LOCK.acquire(blocking=bool(force))
     if not got:
         return _CONN_CACHE
     try:
-        dev = (CONFIG.get("device") or CONFIG.get("preferred")
-               or DEVICE_DEFAULT)
-        ok, why = device_connected(dev)
-        _CONN_CACHE.update(ts=time.time(), ok=bool(ok), why=str(why))
+        ok, dev, ctype, why = _detect_local_printer()
+        _CONN_CACHE.update(ts=time.time(), ok=bool(ok), why=str(why),
+                           dev=dev, conn=ctype)
     except Exception as e:  # noqa: BLE001
-        _CONN_CACHE.update(ts=time.time(), ok=False, why=str(e))
+        _CONN_CACHE.update(ts=time.time(), ok=False, why=str(e),
+                           dev="", conn="")
     finally:
         if got:
             PRINT_LOCK.release()
@@ -2707,6 +2872,8 @@ def relay_status():
     out = _relay_public()
     out["local_connected"] = bool(_CONN_CACHE.get("ok"))
     out["local_reason"] = _CONN_CACHE.get("why") or ""
+    out["local_device"] = _CONN_CACHE.get("dev") or ""
+    out["local_conn"] = _CONN_CACHE.get("conn") or ""
     return out
 
 
@@ -3063,12 +3230,18 @@ def handle(msg):
         if relay.get("via_local_service"):
             dev_ok = bool(relay.get("local_connected"))
             dev_why = relay.get("local_reason") or ""
+            detected = str(relay.get("local_device") or "")
+            detected_conn = str(relay.get("local_conn") or "")
         else:
             cc = _conn_cache_refresh(False)
             dev_ok = bool(cc.get("ok"))
             dev_why = cc.get("why") or ""
-        active = (CONFIG.get("preferred") or CONFIG.get("device")
-                  or DEVICE_DEFAULT)
+            detected = str(cc.get("dev") or "")
+            detected_conn = str(cc.get("conn") or "")
+        active = (detected if dev_ok and detected else
+                  (CONFIG.get("preferred") or CONFIG.get("device")
+                   or DEVICE_DEFAULT))
+        active_conn = detected_conn if dev_ok and detected else conn_type(active)
         printers = []
         for d, c in discover_printers():
             ent = {"device": d, "conn": c}
@@ -3076,10 +3249,10 @@ def handle(msg):
                 ent["connected"] = bool(dev_ok)
             printers.append(ent)
         if active not in [p["device"] for p in printers]:
-            printers.insert(0, {"device": active, "conn": conn_type(active),
+            printers.insert(0, {"device": active, "conn": active_conn,
                                 "connected": bool(dev_ok)})
         return {"ok": True, "host": "db-print", "version": HOST_VERSION,
-                "device": active, "conn": conn_type(active),
+                "device": active, "conn": active_conn,
                 "preferred": CONFIG.get("preferred") or "",
                 "prefer": CONFIG.get("prefer", "auto"),
                 "warm": bool(_WARM.get("ser")),
